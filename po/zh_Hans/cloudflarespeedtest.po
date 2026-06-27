@@ -127,6 +127,9 @@ msgstr "平均延迟上限"
 msgid "Average latency lower bound"
 msgstr "平均延迟下限"
 
+msgid "Packet loss rate cap"
+msgstr "丢包率上限"
+
 msgid "IP list source"
 msgstr "IP 列表来源"
 
