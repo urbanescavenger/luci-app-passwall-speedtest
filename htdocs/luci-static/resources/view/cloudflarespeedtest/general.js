@@ -419,6 +419,12 @@ return view.extend({
 		o.rmempty = true;
 		o.depends('advanced', '1');
 
+		o = s.taboption('advanced', form.Value, 'tlr', _('Packet loss rate cap'));
+		o.datatype = 'ufloat';
+		o.default = '0.2';
+		o.rmempty = true;
+		o.depends('advanced', '1');
+
 		o = s.taboption('advanced', form.Value, 't', _('Delayed speed measurement time'));
 		o.datatype = 'uinteger';
 		o.default = '4';

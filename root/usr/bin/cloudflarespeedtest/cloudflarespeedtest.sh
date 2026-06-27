@@ -27,7 +27,7 @@ echolog() {
 }
 
 function read_config(){
-    get_global_config "enabled" "speed_limit" "custom_url" "threads" "custom_cron_enabled" "custom_cron" "t" "tp" "dt" "dn" "dd" "tl" "tll" "ipv6_enabled" "ip_source" "custom_ip_file" "custom_allip" "advanced" "proxy_mode" "github_proxy" "github_proxy_custom" "httping" "cfcolo"
+    get_global_config "enabled" "speed_limit" "custom_url" "threads" "custom_cron_enabled" "custom_cron" "t" "tp" "dt" "dn" "dd" "tl" "tll" "tlr" "ipv6_enabled" "ip_source" "custom_ip_file" "custom_allip" "advanced" "proxy_mode" "github_proxy" "github_proxy_custom" "httping" "cfcolo"
     get_servers_config "ssr_services" "ssr_enabled" "passwall_enabled" "passwall_services" "passwall2_enabled" "passwall2_services" "bypass_enabled" "bypass_services" "vssr_enabled" "vssr_services" "DNS_enabled" "AliDNS_ip_count" "HOST_enabled" "MosDNS_enabled" "MosDNS_ip_count" "openclash_restart" "AstraDNS_enabled" "AstraDNS_config" "AstraDNS_bin"
 }
 
@@ -285,7 +285,7 @@ function speed_test(){
     fi
 
     if [ $advanced -eq "1" ] ; then
-        command="${command} -tl ${tl} -tll ${tll} -n ${threads} -t ${t} -dt ${dt} -dn ${dn}"
+        command="${command} -tl ${tl} -tll ${tll} -tlr ${tlr:-0.2} -n ${threads} -t ${t} -dt ${dt} -dn ${dn}"
         if [ $dd -eq "1" ] ; then
             command="${command} -dd"
         fi
@@ -299,8 +299,8 @@ function speed_test(){
             fi
         fi
     else
-        # Default param: -tl 200 -tll 40 -n 200 -t 4 -dt 10
-        command="${command} -dn 5"
+        # Default param: -tl 200 -tll 40 -tlr 0.2 -n 200 -t 4 -dt 10
+        command="${command} -tl ${tl} -tll ${tll} -tlr ${tlr:-0.2} -dn 5"
     fi
 
     appinit
