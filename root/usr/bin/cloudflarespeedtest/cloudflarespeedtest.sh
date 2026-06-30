@@ -388,8 +388,12 @@ function speed_test(){
 
     echo $command >> $LOG_FILE 2>&1
     echolog "-----------start----------"
-    $command >> $LOG_FILE 2>&1
-    command_rc=$?
+    rc_file='/tmp/cf_speedtest_rc'
+    rm -f "$rc_file"
+    ( $command 2>&1; echo $? > "$rc_file" ) | tr '\r' '\n' | awk -f /usr/bin/cloudflarespeedtest/progress.awk >> $LOG_FILE
+    command_rc="$(cat "$rc_file" 2>/dev/null)"
+    [ -n "$command_rc" ] || command_rc=0
+    rm -f "$rc_file"
     echolog "-----------end------------"
 
     if [ $command_rc -ne 0 ]; then
