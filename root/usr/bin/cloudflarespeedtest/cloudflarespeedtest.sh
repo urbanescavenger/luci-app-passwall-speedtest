@@ -601,7 +601,7 @@ node_speed_test() {
         rm -f "$result_tmp"
         uci set passwall.${NODE_TEST_NODE}.address="${NODE_TEST_ORIG_ADDR}"
         uci commit passwall
-        NODE_TEST_DONE=0
+        NODE_TEST_DONE=1
         node_test_cleanup
         trap - EXIT INT TERM
         return 1
