@@ -455,7 +455,15 @@ node_speed_test() {
     # 校验 passwall 已安装
     [ -f /usr/share/passwall/app.sh ] || { echolog "未安装 passwall，无法使用走节点测速模式"; return 1; }
     [ -f /usr/share/passwall/utils.sh ] || { echolog "缺少 passwall utils.sh，无法使用走节点测速模式"; return 1; }
+    # passwall 的 utils.sh 会覆盖 LOG_FILE 与 echolog()，先保存再恢复，避免日志写进 passwall 的日志文件
+    local _cfst_log_file="$LOG_FILE"
     . /usr/share/passwall/utils.sh
+    LOG_FILE="$_cfst_log_file"
+    echolog() {
+        local d="$(date "+%Y-%m-%d %H:%M:%S")"
+        echo -e "$d: $*"
+        echo -e "$d: $*" >>$LOG_FILE
+    }
 
     NODE_TEST_NODE="${node_test_node:-}"
     [ -n "${NODE_TEST_NODE}" ] || { echolog "未选择 passwall 节点，无法走节点测速"; return 1; }
