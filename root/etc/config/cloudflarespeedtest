@@ -22,6 +22,7 @@ config global 'global'
 	option node_test_count '30'
 	option node_test_timeout '5'
 	option node_test_probes '3'
+	option node_test_threads '5'
 
 config servers 'servers'
 	option ssr_enabled '0'

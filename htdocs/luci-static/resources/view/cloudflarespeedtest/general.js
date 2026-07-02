@@ -373,12 +373,12 @@ return view.extend({
 
 		// ── 走节点测速模式 ──
 		o = s.taboption('basic', form.Flag, 'node_test', _('Node-based speed test'),
-			_('When enabled, replaces the direct CloudflareSpeedTest path: writes each candidate Cloudflare IP into the selected passwall node\'s <em>address</em>, spins up a local SOCKS via passwall, and probes latency with <code>curl -I</code> (<code>time_pretransfer</code> → ms). Only latency is measured (no download bandwidth). The node\'s address is briefly rewritten during the test, so expect short hiccups on that node — use a dedicated or idle node.'));
+			_('When enabled, replaces the direct CloudflareSpeedTest path: writes each candidate Cloudflare IP into a passwall node\'s <em>address</em>, spins up a local SOCKS via passwall, and probes latency with <code>curl -I</code> (<code>time_pretransfer</code> → ms). Only latency is measured (no download bandwidth). <strong>Multi-threaded:</strong> if passwall nodes are selected in the Third-Party tab, those nodes run as parallel workers — each tests all candidate IPs through its own chain and gets its own best IP written back; otherwise the single node below is tested serially. Worker addresses are briefly rewritten during the test, so expect short hiccups on those nodes — use dedicated or idle nodes.'));
 		o.default = o.disabled;
 		o.rmempty = false;
 
-		o = s.taboption('basic', form.ListValue, 'node_test_node', _('Passwall node to test through'),
-			_('Select a CF-CDN-fronted passwall node (VLESS/VMess/Trojan/SS…). Its <em>address</em> will be cycled through candidate IPs and finally set to the fastest one. SOCKS-type nodes are not supported.'));
+		o = s.taboption('basic', form.ListValue, 'node_test_node', _('Passwall node to test through (single-node fallback)'),
+			_('Used only when no passwall workers are selected in the Third-Party tab. Select a CF-CDN-fronted passwall node (VLESS/VMess/Trojan/SS…). Its <em>address</em> will be cycled through candidate IPs and finally set to the fastest one. SOCKS-type nodes are not supported.'));
 		o.depends('node_test', '1');
 		o.value('', _('-- Please choose --'));
 		passwallNodes.forEach(function(n) { o.value(n.value, n.label); });
@@ -414,6 +414,13 @@ return view.extend({
 		o.depends('node_test', '1');
 		o.datatype = 'uinteger';
 		o.default = '3';
+		o.rmempty = false;
+
+		o = s.taboption('basic', form.Value, 'node_test_threads', _('Max parallel workers'),
+			_('Cap on concurrently running passwall workers (only relevant when passwall nodes are selected in the Third-Party tab). 0 means run all workers at once. Each worker runs its own SOCKS+curl chain, so high values need more RAM/CPU — keep ≤ node count and mind router limits.'));
+		o.depends('node_test', '1');
+		o.datatype = 'uinteger';
+		o.default = '5';
 		o.rmempty = false;
 
 		o = s.taboption('basic', form.ListValue, 'github_proxy', _('GitHub Mirror'),
