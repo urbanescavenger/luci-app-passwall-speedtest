@@ -220,14 +220,34 @@ function first_result_ip(){
 
 # 按「下载速度(第6列)降序、平均延迟(第5列)升序」排序结果数据行，表头保留在首行。
 # 兼容测速被中断、二进制未完成最终排序的情况，保证最快 IP 位于首行。
+# 第二参数 mode=latency 时（走节点测速模式，下载列恒 0.00）仅按延迟升序排。
+# 用 awk 自实现排序，不依赖 sort 的 -k/-n 浮点修饰符（某些 busybox sort 会忽略 -k 键
+# 退化为整行字典序，导致选错最优 IP）。
 function sort_result(){
     local file="$1"
+    local mode="${2:-}"
     [ -s "$file" ] || return 0
     local header
     header=$(sed -n '1p' "$file" 2>/dev/null)
     {
         [ -n "$header" ] && echo "$header"
-        sed '1d' "$file" 2>/dev/null | grep -v '^#' | LC_ALL=C sort -t, -k6,6rn -k5,5n 2>/dev/null
+        sed '1d' "$file" 2>/dev/null | grep -v '^#' | \
+        awk -F, -v mode="$mode" '
+            { dl[NR]=($6=="")?0:($6+0); lat[NR]=($5=="")?0:($5+0); line[NR]=$0 }
+            END {
+                n=NR
+                for (i=2;i<=n;i++) {
+                    dk=dl[i]; lk=lat[i]; b=line[i]; j=i-1
+                    while (j>=1 && cmp(dk,lk,dl[j],lat[j],mode)) { dl[j+1]=dl[j]; lat[j+1]=lat[j]; line[j+1]=line[j]; j-- }
+                    dl[j+1]=dk; lat[j+1]=lk; line[j+1]=b
+                }
+                for (i=1;i<=n;i++) print line[i]
+            }
+            function cmp(dk,lk,dj,lj,mode) {
+                if (mode=="latency") return (lk<lj)
+                if (dk!=dj) return (dk>dj)
+                return (lk<lj)
+            }'
     } > "${file}.sorted" 2>/dev/null
     [ -s "${file}.sorted" ] && mv -f "${file}.sorted" "$file" || rm -f "${file}.sorted"
 }
@@ -604,8 +624,8 @@ node_speed_test() {
         echolog "进度: 走节点测速 ${idx}/${total} ($((idx*100/total))%) - ${ip} 延迟 ${avg_ms}ms 丢包 ${loss} [${status}]"
     done
 
-    # 排序（下载列全 0.00 → 按延迟升序）
-    sort_result "$result_tmp"
+    # 排序（下载列全 0.00 → 按延迟升序，mode=latency 走 awk 自排序，不依赖 busybox sort）
+    sort_result "$result_tmp" latency
 
     if [ -z "$(first_result_ip "$result_tmp")" ]; then
         echolog "走节点测速结果 IP 数量为 0，恢复源节点原 address 并保留上一次结果"
