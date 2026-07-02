@@ -686,6 +686,10 @@ node_speed_test() {
                     fi
                 fi
 
+                # 单 IP 日志：直接追加 LOG_FILE（worker 的 stdout 已重定向到结果文件，不能用 echolog）
+                status=$([ $keep -eq 1 ] && echo "保留" || echo "丢弃")
+                echo "$(date '+%Y-%m-%d %H:%M:%S'): 进度: 走节点测速 $(( (b - 1) * K + w ))/${total} - ${ip_b} 延迟 ${avg_ms}ms 丢包 ${loss} [${status}]" >> "$LOG_FILE"
+
                 if [ $keep -eq 1 ]; then
                     echo "${ip_b},${sent},${recv},${loss},${avg_ms},0.00,"
                 fi
@@ -700,8 +704,6 @@ node_speed_test() {
             rm -f "$wf"
         done
         rm -f "$ports_file"
-
-        echolog "进度: 走节点测速 ${end}/${total} ($((end*100/total))%) 批次 ${b}/${nbatches} 完成"
     done
 
     rm -f "$ip_tmp"
