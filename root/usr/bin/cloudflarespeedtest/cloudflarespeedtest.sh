@@ -27,7 +27,7 @@ echolog() {
 }
 
 function read_config(){
-    get_global_config "enabled" "speed_limit" "custom_url" "threads" "custom_cron_enabled" "custom_cron" "t" "tp" "dt" "dn" "dd" "tl" "tll" "tlr" "ipv6_enabled" "ip_source" "custom_ip_file" "custom_allip" "advanced" "proxy_mode" "github_proxy" "github_proxy_custom" "httping" "cfcolo" "node_test" "node_test_node" "node_test_url" "node_test_count" "node_test_timeout" "node_test_probes" "node_test_threads"
+    get_global_config "enabled" "speed_limit" "custom_url" "threads" "custom_cron_enabled" "custom_cron" "t" "tp" "dt" "dn" "dd" "tl" "tll" "tlr" "ipv6_enabled" "ip_source" "custom_ip_file" "custom_allip" "advanced" "proxy_mode" "github_proxy" "github_proxy_custom" "httping" "cfcolo" "node_test" "node_test_node" "node_test_url" "node_test_count" "node_test_timeout" "node_test_probes"
     get_servers_config "ssr_services" "ssr_enabled" "passwall_enabled" "passwall_services" "passwall2_enabled" "passwall2_services" "bypass_enabled" "bypass_services" "vssr_enabled" "vssr_services" "DNS_enabled" "AliDNS_ip_count" "HOST_enabled" "MosDNS_enabled" "MosDNS_ip_count" "openclash_restart" "AstraDNS_enabled" "AstraDNS_config" "AstraDNS_bin"
 }
 
@@ -430,7 +430,6 @@ NODE_TEST_FLAG=""
 NODE_TEST_NODE=""
 NODE_TEST_ORIG_ADDR=""
 NODE_TEST_DONE=0
-NODE_TEST_TMP_NODES=""
 
 node_test_cleanup() {
     [ "${NODE_TEST_CLEANED:-0}" = "1" ] && return
@@ -444,54 +443,12 @@ node_test_cleanup() {
         busybox pgrep -af "${NODE_TEST_FLAG}" 2>/dev/null | awk '! /cloudflarespeedtest\.sh/{print $1}' | xargs kill -9 >/dev/null 2>&1
         rm -rf /tmp/etc/passwall/*"${NODE_TEST_FLAG}"* 2>/dev/null
     fi
-    # 删除本次创建的临时克隆节点（Phase2 并行模式）
-    if [ -n "${NODE_TEST_TMP_NODES:-}" ]; then
-        local t
-        for t in $NODE_TEST_TMP_NODES; do
-            uci -q delete "passwall.$t"
-        done
-        uci -q commit passwall
+    # 串行模式会改写源节点 address；未正常完成时恢复原值
+    if [ "${NODE_TEST_DONE:-0}" != "1" ] && [ -n "${NODE_TEST_NODE}" ] && [ -n "${NODE_TEST_ORIG_ADDR}" ]; then
+        uci set passwall.${NODE_TEST_NODE}.address="${NODE_TEST_ORIG_ADDR}"
+        uci commit passwall
+        echolog "走节点测速被中断或失败，已恢复节点 ${NODE_TEST_NODE} 原 address"
     fi
-}
-
-# 克隆源 passwall 节点到临时 section（复制所有标量选项；list 选项用 add_list）
-clone_passwall_node() {
-    local src=$1 dst=$2
-    uci -q set "passwall.${dst}=nodes"
-    local prefix="passwall.${src}."
-    local tmp opts_file line rest opt val cnt
-    tmp=$(mktemp)
-    opts_file=$(mktemp)
-    uci -q show "passwall.${src}" 2>/dev/null > "$tmp"
-    # 第一遍：抽取每个 option 名到 opts_file（用于 list 检测）
-    while IFS= read -r line; do
-        case "$line" in
-            "$prefix"*)
-                rest="${line#$prefix}"
-                opt="${rest%%=*}"
-                [ "$opt" = "$rest" ] && continue
-                printf '%s\n' "$opt" >> "$opts_file"
-                ;;
-        esac
-    done < "$tmp"
-    # 第二遍：回放（同名 option 出现 >1 次即 list，用 add_list；否则 set）
-    while IFS= read -r line; do
-        case "$line" in
-            "$prefix"*)
-                rest="${line#$prefix}"
-                opt="${rest%%=*}"
-                [ "$opt" = "$rest" ] && continue
-                val="${rest#*=}"
-                cnt=$(grep -cx -- "$opt" "$opts_file" 2>/dev/null)
-                if [ "${cnt:-1}" -le 1 ]; then
-                    uci -q set "passwall.${dst}.${opt}=${val}"
-                else
-                    uci -q add_list "passwall.${dst}.${opt}=${val}"
-                fi
-                ;;
-        esac
-    done < "$tmp"
-    rm -f "$tmp" "$opts_file"
 }
 
 node_speed_test() {
@@ -525,7 +482,6 @@ node_speed_test() {
     NODE_TEST_FLAG="node_test_$$"
     NODE_TEST_DONE=0
     NODE_TEST_CLEANED=0
-    NODE_TEST_TMP_NODES=""
     trap node_test_cleanup EXIT INT TERM
 
     rm -rf $LOG_FILE
@@ -557,170 +513,105 @@ node_speed_test() {
     [ "$probes" -ge 1 ] 2>/dev/null || probes=1
     [ "$probes" -le 5 ] 2>/dev/null || probes=5
 
-    # 并行度 K（默认 5，上限 16，不超过候选数）
-    local K="${node_test_threads:-5}"
-    case "$K" in ''|*[!0-9]*) K=5 ;; esac
-    [ "$K" -ge 1 ] 2>/dev/null || K=5
-    [ "$K" -le 16 ] 2>/dev/null || K=16
-    [ "$K" -gt "$total" ] && K=$total
+    echolog "开始走节点测速（节点: ${NODE_TEST_NODE}, 候选: ${total} 个, 每IP探测 ${probes} 次, 超时 ${timeout}s）"
+    echolog "提示：测速期间源节点 ${NODE_TEST_NODE} 的 address 会被反复改写，该节点会短暂抖动，测完写回最优 IP"
 
-    # 预创建 K 个临时克隆节点（复制源节点协议配置，只换 address；源节点全程不动）
-    local i tmp
-    for i in $(seq 1 $K); do
-        tmp="cfst_nt_${NODE_TEST_FLAG}_${i}"
-        clone_passwall_node "$NODE_TEST_NODE" "$tmp"
-        uci -q set "passwall.${tmp}.remarks=[cfst-temp-${i}]"
-        NODE_TEST_TMP_NODES="$NODE_TEST_TMP_NODES $tmp"
+    local idx=0
+    local ip
+    echo "$ip_list" | while read -r ip; do
+        [ -n "$ip" ] || continue
+        idx=$((idx + 1))
+
+        # 写入候选 IP 作为源节点 address
+        uci set passwall.${NODE_TEST_NODE}.address="${ip}"
+        uci commit passwall
+
+        # 拉起本地 SOCKS（镜像 passwall url_test_node）
+        local socks_port
+        socks_port=$(get_new_port 48900 tcp,udp)
+        NO_REC_PROCESS=1 /usr/share/passwall/app.sh run_socks \
+            flag="${NODE_TEST_FLAG}" node=${NODE_TEST_NODE} \
+            bind=127.0.0.1 socks_port=${socks_port} \
+            config_file=${NODE_TEST_FLAG}.json >>$LOG_FILE 2>&1
+
+        # 就绪轮询 + 就绪即探测（合并，不盲等、不浪费请求）：
+        # curl 退出码 7=连接拒绝(SOCKS 端口未开)→ sleep 0.3 重试(不计入探测,上限 10 次≈3s)
+        # 非 7=端口已开,这次 curl 即算一次有效探测,解析 code:time_pretransfer
+        local sent=0 recv=0 latencies="" probes_done=0 not_ready=0
+        while [ $probes_done -lt $probes ]; do
+            local res code tpre rc
+            res=$(curl -x socks5h://127.0.0.1:${socks_port} -I -skL \
+                --connect-timeout 3 --max-time ${timeout} \
+                -o /dev/null -w "%{http_code}:%{time_pretransfer}" "${probe_url}" 2>/dev/null)
+            rc=$?
+            if [ $rc -eq 7 ]; then
+                not_ready=$((not_ready + 1))
+                [ $not_ready -ge 10 ] && break
+                sleep 0.3
+                continue
+            fi
+            not_ready=0
+            sent=$((sent + 1))
+            probes_done=$((probes_done + 1))
+            code="${res%%:*}"
+            tpre="${res##*:}"
+            case "$code" in
+                200|204|301|302|307|308|40[0-9])
+                    recv=$((recv + 1))
+                    latencies="${latencies} ${tpre}"
+                    ;;
+            esac
+        done
+
+        # 清理本次 SOCKS（按 flag 杀进程、删临时文件）
+        local pid_file
+        for pid_file in /tmp/etc/passwall/*"${NODE_TEST_FLAG}"*_plugin.pid; do
+            [ -s "$pid_file" ] && kill -9 "$(head -n1 "$pid_file")" >/dev/null 2>&1
+        done
+        busybox pgrep -af "${NODE_TEST_FLAG}" 2>/dev/null | awk '! /cloudflarespeedtest\.sh/{print $1}' | xargs kill -9 >/dev/null 2>&1
+        rm -rf /tmp/etc/passwall/*"${NODE_TEST_FLAG}"* 2>/dev/null
+
+        # 计算平均延迟（毫秒）与丢包率
+        local avg_ms=0 loss="1.00"
+        if [ $recv -gt 0 ]; then
+            loss=$(awk -v s=$sent -v r=$recv 'BEGIN{printf "%.2f", (s-r)/s}')
+            avg_ms=$(echo "$latencies" | tr ' ' '\n' | grep -E '^[0-9.]+$' | awk '{s+=$1; n++} END{ if(n>0) printf "%.2f", s/n*1000 }')
+            [ -z "$avg_ms" ] && avg_ms=0
+        fi
+
+        # 过滤：延迟上限 tl、下限 tll、丢包率 tlr
+        local keep=1
+        if [ $recv -eq 0 ]; then
+            keep=0
+        else
+            if [ -n "${tl:-}" ] && [ "${tl}" -gt 0 ] 2>/dev/null; then
+                [ "$(awk -v v=$avg_ms -v c=$tl 'BEGIN{print (v>c)?1:0}')" = "1" ] && keep=0
+            fi
+            if [ -n "${tll:-}" ] && [ "${tll}" -gt 0 ] 2>/dev/null; then
+                [ "$(awk -v v=$avg_ms -v c=$tll 'BEGIN{print (v<c)?1:0}')" = "1" ] && keep=0
+            fi
+            if [ -n "${tlr:-}" ]; then
+                [ "$(awk -v v=$loss -v c=$tlr 'BEGIN{print (v>c)?1:0}')" = "1" ] && keep=0
+            fi
+        fi
+
+        if [ $keep -eq 1 ]; then
+            echo "${ip},${sent},${recv},${loss},${avg_ms},0.00," >> "$result_tmp"
+        fi
+
+        local status
+        status=$([ $keep -eq 1 ] && echo "保留" || echo "丢弃")
+        echolog "进度: 走节点测速 ${idx}/${total} ($((idx*100/total))%) - ${ip} 延迟 ${avg_ms}ms 丢包 ${loss} [${status}]"
     done
-    uci -q commit passwall
-
-    echolog "开始走节点测速（节点: ${NODE_TEST_NODE}, 候选: ${total} 个, 每IP探测 ${probes} 次, 并行 ${K}, 超时 ${timeout}s）"
-    echolog "提示：测速经 ${K} 个临时克隆节点进行，源节点不受影响，测完把最优 IP 写回源节点"
-
-    # 候选 IP 落盘以便按批切片
-    local ip_tmp
-    ip_tmp=$(mktemp)
-    printf '%s\n' "$ip_list" > "$ip_tmp"
-
-    local nbatches=$(( (total + K - 1) / K ))
-    local b
-    for b in $(seq 1 $nbatches); do
-        local start=$(( (b - 1) * K + 1 ))
-        local end=$(( start + K - 1 ))
-        [ "$end" -gt "$total" ] && end=$total
-        local batch_ips
-        batch_ips=$(sed -n "${start},${end}p" "$ip_tmp")
-        local batch_n
-        batch_n=$(printf '%s\n' "$batch_ips" | grep -c .)
-
-        # 主进程串行：把本批 IP 写入各临时克隆节点 address，一次性 commit（不并发写 uci）
-        local w=0
-        for tmp in $NODE_TEST_TMP_NODES; do
-            w=$((w + 1))
-            [ "$w" -gt "$batch_n" ] && break
-            local ip_b
-            ip_b=$(printf '%s\n' "$batch_ips" | sed -n "${w}p")
-            uci -q set "passwall.${tmp}.address=${ip_b}"
-        done
-        uci -q commit passwall
-
-        # 每批分配 K 个端口（auto 模式跨进程协调、互不冲突，且每批用新端口避免 TIME_WAIT 复用）
-        local ports_file
-        ports_file=$(mktemp)
-        w=0
-        for tmp in $NODE_TEST_TMP_NODES; do
-            w=$((w + 1))
-            [ "$w" -gt "$batch_n" ] && break
-            get_new_port auto tcp,udp >> "$ports_file"
-        done
-
-        # 并行：起 K 个 worker，各拉本地 SOCKS + 就绪轮询探测 + 清理，结果写各自文件
-        w=0
-        for tmp in $NODE_TEST_TMP_NODES; do
-            w=$((w + 1))
-            [ "$w" -gt "$batch_n" ] && break
-            local ip_b port
-            ip_b=$(printf '%s\n' "$batch_ips" | sed -n "${w}p")
-            port=$(sed -n "${w}p" "$ports_file")
-            local wflag="${NODE_TEST_FLAG}_w${w}"
-            (
-                NO_REC_PROCESS=1 /usr/share/passwall/app.sh run_socks \
-                    flag="${wflag}" node=${tmp} \
-                    bind=127.0.0.1 socks_port=${port} \
-                    config_file=${wflag}.json >>"$LOG_FILE" 2>&1
-
-                # 就绪轮询 + 就绪即探测（合并）——子shell内不用 local（ash 不允许在子shell里用 local）
-                sent=0 recv=0 latencies="" probes_done=0 not_ready=0
-                while [ $probes_done -lt $probes ]; do
-                    res=$(curl -x socks5h://127.0.0.1:${port} -I -skL \
-                        --connect-timeout 3 --max-time ${timeout} \
-                        -o /dev/null -w "%{http_code}:%{time_pretransfer}" "${probe_url}" 2>/dev/null)
-                    rc=$?
-                    if [ $rc -eq 7 ]; then
-                        not_ready=$((not_ready + 1))
-                        [ $not_ready -ge 10 ] && break
-                        sleep 0.3
-                        continue
-                    fi
-                    not_ready=0
-                    sent=$((sent + 1))
-                    probes_done=$((probes_done + 1))
-                    code="${res%%:*}"
-                    tpre="${res##*:}"
-                    case "$code" in
-                        200|204|301|302|307|308|40[0-9])
-                            recv=$((recv + 1))
-                            latencies="${latencies} ${tpre}"
-                            ;;
-                    esac
-                done
-
-                # 清理本 worker 的 SOCKS
-                for pid_file in /tmp/etc/passwall/*"${wflag}"*_plugin.pid; do
-                    [ -s "$pid_file" ] && kill -9 "$(head -n1 "$pid_file")" >/dev/null 2>&1
-                done
-                busybox pgrep -af "${wflag}" 2>/dev/null | awk '! /cloudflarespeedtest\.sh/{print $1}' | xargs kill -9 >/dev/null 2>&1
-                rm -rf /tmp/etc/passwall/*"${wflag}"* 2>/dev/null
-
-                # 计算平均延迟与丢包率
-                avg_ms=0 loss="1.00"
-                if [ $recv -gt 0 ]; then
-                    loss=$(awk -v s=$sent -v r=$recv 'BEGIN{printf "%.2f", (s-r)/s}')
-                    avg_ms=$(echo "$latencies" | tr ' ' '\n' | grep -E '^[0-9.]+$' | awk '{s+=$1; n++} END{ if(n>0) printf "%.2f", s/n*1000 }')
-                    [ -z "$avg_ms" ] && avg_ms=0
-                fi
-
-                # 过滤
-                keep=1
-                if [ $recv -eq 0 ]; then
-                    keep=0
-                else
-                    if [ -n "${tl:-}" ] && [ "${tl}" -gt 0 ] 2>/dev/null; then
-                        [ "$(awk -v v=$avg_ms -v c=$tl 'BEGIN{print (v>c)?1:0}')" = "1" ] && keep=0
-                    fi
-                    if [ -n "${tll:-}" ] && [ "${tll}" -gt 0 ] 2>/dev/null; then
-                        [ "$(awk -v v=$avg_ms -v c=$tll 'BEGIN{print (v<c)?1:0}')" = "1" ] && keep=0
-                    fi
-                    if [ -n "${tlr:-}" ]; then
-                        [ "$(awk -v v=$loss -v c=$tlr 'BEGIN{print (v>c)?1:0}')" = "1" ] && keep=0
-                    fi
-                fi
-
-                # 单 IP 日志：直接追加 LOG_FILE（worker 的 stdout 已重定向到结果文件，不能用 echolog）
-                status=$([ $keep -eq 1 ] && echo "保留" || echo "丢弃")
-                echo "$(date '+%Y-%m-%d %H:%M:%S'): 进度: 走节点测速 $(( (b - 1) * K + w ))/${total} - ${ip_b} 延迟 ${avg_ms}ms 丢包 ${loss} [${status}]" >> "$LOG_FILE"
-
-                if [ $keep -eq 1 ]; then
-                    echo "${ip_b},${sent},${recv},${loss},${avg_ms},0.00,"
-                fi
-            ) > "${ip_tmp}.b${b}.w${w}" 2>/dev/null &
-        done
-        wait
-
-        # 收集本批 worker 结果
-        local wf
-        for wf in "${ip_tmp}.b${b}".w*; do
-            [ -s "$wf" ] && cat "$wf" >> "$result_tmp"
-            rm -f "$wf"
-        done
-        rm -f "$ports_file"
-    done
-
-    rm -f "$ip_tmp"
-
-    # 删除临时克隆节点
-    for tmp in $NODE_TEST_TMP_NODES; do
-        uci -q delete "passwall.$tmp"
-    done
-    uci -q commit passwall
-    NODE_TEST_TMP_NODES=""
 
     # 排序（下载列全 0.00 → 按延迟升序）
     sort_result "$result_tmp"
 
     if [ -z "$(first_result_ip "$result_tmp")" ]; then
-        echolog "走节点测速结果 IP 数量为 0，保留上一次结果（源节点未改动）"
+        echolog "走节点测速结果 IP 数量为 0，恢复源节点原 address 并保留上一次结果"
         rm -f "$result_tmp"
+        uci set passwall.${NODE_TEST_NODE}.address="${NODE_TEST_ORIG_ADDR}"
+        uci commit passwall
         NODE_TEST_DONE=1
         node_test_cleanup
         trap - EXIT INT TERM
