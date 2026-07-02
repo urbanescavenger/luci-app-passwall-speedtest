@@ -410,10 +410,10 @@ return view.extend({
 		o.rmempty = false;
 
 		o = s.taboption('basic', form.Value, 'node_test_probes', _('Probes per IP'),
-			_('How many curl probes per candidate IP in node mode (independent of the cdnspeedtest latency count <code>t</code>). Each probe is a full SOCKS+curl, so higher values are slower; 1 matches passwall and is fastest.'));
+			_('How many curl probes per candidate IP in node mode (independent of the cdnspeedtest latency count <code>t</code>). Each probe is a full SOCKS+curl, so higher values are slower. If <strong>any</strong> single probe times out, that IP is discarded immediately and the remaining probes are skipped — only IPs that succeed on <em>all</em> probes are kept, so the best IP is a stable one.'));
 		o.depends('node_test', '1');
 		o.datatype = 'uinteger';
-		o.default = '1';
+		o.default = '3';
 		o.rmempty = false;
 
 		o = s.taboption('basic', form.ListValue, 'github_proxy', _('GitHub Mirror'),

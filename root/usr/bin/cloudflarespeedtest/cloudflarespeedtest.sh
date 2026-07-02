@@ -527,10 +527,11 @@ node_speed_test() {
     local probe_url="${node_test_url:-https://www.google.com/generate_204}"
     local timeout="${node_test_timeout:-5}"
     case "$timeout" in ''|*[!0-9]*) timeout=5 ;; esac
-    # 节点模式探测次数独立于 cdnspeedtest 的 t：默认 1（与 passwall 单次探测一致），上限 5
-    local probes="${node_test_probes:-1}"
-    case "$probes" in ''|*[!0-9]*) probes=1 ;; esac
-    [ "$probes" -ge 1 ] 2>/dev/null || probes=1
+    # 节点模式探测次数独立于 cdnspeedtest 的 t：默认 3（多次探测取稳值），上限 5。
+    # 任一次探测非成功即丢弃该 IP，只保留 N 次全成功的稳定 IP。
+    local probes="${node_test_probes:-3}"
+    case "$probes" in ''|*[!0-9]*) probes=3 ;; esac
+    [ "$probes" -ge 1 ] 2>/dev/null || probes=3
     [ "$probes" -le 5 ] 2>/dev/null || probes=5
 
     echolog "开始走节点测速（节点: ${NODE_TEST_NODE}, 候选: ${total} 个, 每IP探测 ${probes} 次, 超时 ${timeout}s）"
@@ -557,7 +558,8 @@ node_speed_test() {
         # 就绪轮询 + 就绪即探测（合并，不盲等、不浪费请求）：
         # curl 退出码 7=连接拒绝(SOCKS 端口未开)→ sleep 0.3 重试(不计入探测,上限 10 次≈3s)
         # 非 7=端口已开,这次 curl 即算一次有效探测,解析 code:time_pretransfer
-        local sent=0 recv=0 latencies="" probes_done=0 not_ready=0
+        # 任一次探测非成功(超时/空/5xx 等)即 fail=1 并立即跳出 → 该 IP 整体丢弃，只保留 N 次全成功的稳定 IP。
+        local sent=0 recv=0 latencies="" probes_done=0 not_ready=0 fail=0
         while [ $probes_done -lt $probes ]; do
             local res code tpre rc
             res=$(curl -x socks5h://127.0.0.1:${socks_port} -I -skL \
@@ -580,6 +582,10 @@ node_speed_test() {
                     recv=$((recv + 1))
                     latencies="${latencies} ${tpre}"
                     ;;
+                *)
+                    fail=1
+                    break
+                    ;;
             esac
         done
 
@@ -599,9 +605,9 @@ node_speed_test() {
             [ -z "$avg_ms" ] && avg_ms=0
         fi
 
-        # 过滤：延迟上限 tl、下限 tll、丢包率 tlr
+        # 过滤：任一次探测失败(fail)或未完成全部探测(recv<probes)即丢弃；否则按延迟上限 tl、下限 tll、丢包率 tlr
         local keep=1
-        if [ $recv -eq 0 ]; then
+        if [ $fail -eq 1 ] || [ $recv -lt $probes ]; then
             keep=0
         else
             if [ -n "${tl:-}" ] && [ "${tl}" -gt 0 ] 2>/dev/null; then
