@@ -36,6 +36,12 @@ const callBestResult = rpc.declare({
 	expect: { content: '' }
 });
 
+const callListNodes = rpc.declare({
+	object: 'cloudflarespeedtest',
+	method: 'list_nodes',
+	expect: {}
+});
+
 function script(src) {
 	return new Promise(function(resolve, reject) {
 		const existing = document.querySelector('script[src="%s"]'.format(src));
@@ -107,7 +113,8 @@ return view.extend({
 			uci.load('cloudflarespeedtest'),
 			callStatus(),
 			callBestResult(),
-			callHistory()
+			callHistory(),
+			callListNodes()
 		]);
 	},
 
@@ -268,6 +275,8 @@ return view.extend({
 		const status = data[1] || {};
 		const bestResult = data[2] || '';
 		const history = data[3] || [];
+		const nodes = data[4] || {};
+		const passwallNodes = (nodes.passwall && nodes.passwall.nodes) || [];
 
 		m = new form.Map('cloudflarespeedtest', _('Cloudflare Speed Test'),
 			_('Schedules and runs CloudflareSpeedTest with the selected IP list, automatically applying the fastest IPs to supported integrations') +
@@ -360,6 +369,59 @@ return view.extend({
 		o.value('gfw', _('GFW List'));
 		o.value('close', _('CLOSE'));
 		o.default = 'gfw';
+		o.depends('node_test', '0');
+
+		// ── 走节点测速模式 ──
+		o = s.taboption('basic', form.Flag, 'node_test', _('Node-based speed test'),
+			_('When enabled, replaces the direct CloudflareSpeedTest path: writes each candidate Cloudflare IP into the selected passwall node\'s <em>address</em>, spins up a local SOCKS via passwall, and probes latency with <code>curl -I</code> (<code>time_pretransfer</code> → ms). Only latency is measured (no download bandwidth). The node\'s address is briefly rewritten during the test, so expect short hiccups on that node — use a dedicated or idle node.'));
+		o.default = o.disabled;
+		o.rmempty = false;
+
+		o = s.taboption('basic', form.ListValue, 'node_test_node', _('Passwall node to test through'),
+			_('Select a CF-CDN-fronted passwall node (VLESS/VMess/Trojan/SS…). Its <em>address</em> will be cycled through candidate IPs and finally set to the fastest one. SOCKS-type nodes are not supported.'));
+		o.depends('node_test', '1');
+		o.value('', _('-- Please choose --'));
+		passwallNodes.forEach(function(n) { o.value(n.value, n.label); });
+		o.rmempty = true;
+
+		o = s.taboption('basic', form.Value, 'node_test_url', _('Probe URL'),
+			_('URL probed via the node\'s local SOCKS; only the HTTP HEAD latency is measured. generate_204 / connectivity-check endpoints are preferred.'));
+		o.depends('node_test', '1');
+		o.default = 'https://www.google.com/generate_204';
+		o.value('https://www.google.com/generate_204', 'Google');
+		o.value('https://www.gstatic.com/generate_204', 'Gstatic');
+		o.value('https://speed.cloudflare.com/__down?bytes=1', 'Cloudflare');
+		o.value('https://connect.rom.miui.com/generate_204', 'MIUI (CN)');
+		o.value('https://connectivitycheck.platform.hicloud.com/generate_204', 'HiCloud (CN)');
+		o.rmempty = false;
+
+		o = s.taboption('basic', form.Value, 'node_test_count', _('Max IPs to test'),
+			_('This mode tests IPs serially through the node (~3-7s each). Cap the count to avoid long runs; use a smaller IP list or lower this value for faster results.'));
+		o.depends('node_test', '1');
+		o.datatype = 'uinteger';
+		o.default = '30';
+		o.rmempty = false;
+
+		o = s.taboption('basic', form.Value, 'node_test_timeout', _('Probe timeout (s)'),
+			_('Per-IP curl <code>--max-time</code> in seconds.'));
+		o.depends('node_test', '1');
+		o.datatype = 'uinteger';
+		o.default = '5';
+		o.rmempty = false;
+
+		o = s.taboption('basic', form.Value, 'node_test_probes', _('Probes per IP'),
+			_('How many curl probes per candidate IP in node mode (independent of the cdnspeedtest latency count <code>t</code>). Each probe is a full SOCKS+curl, so higher values are slower; 1 matches passwall and is fastest.'));
+		o.depends('node_test', '1');
+		o.datatype = 'uinteger';
+		o.default = '1';
+		o.rmempty = false;
+
+		o = s.taboption('basic', form.Value, 'node_test_threads', _('Parallel workers'),
+			_('How many candidate IPs to test in parallel. Each worker spawns its own xray/sing-box via a temp clone of the passwall node, so higher values use more memory — on weak routers keep this small (3-5). The source node is not touched during the test; only the fastest IP is written back at the end.'));
+		o.depends('node_test', '1');
+		o.datatype = 'uinteger';
+		o.default = '5';
+		o.rmempty = false;
 
 		o = s.taboption('basic', form.ListValue, 'github_proxy', _('GitHub Mirror'),
 			_('Only used when downloading the CloudflareSpeedTest core from GitHub releases'));
@@ -436,17 +498,20 @@ return view.extend({
 		o.default = '10';
 		o.rmempty = true;
 		o.depends('advanced', '1');
+		o.depends('node_test', '0');
 
 		o = s.taboption('advanced', form.Value, 'dn', _('Number of download speed tests'));
 		o.datatype = 'uinteger';
 		o.default = '5';
 		o.rmempty = true;
 		o.depends('advanced', '1');
+		o.depends('node_test', '0');
 
 		o = s.taboption('advanced', form.Flag, 'dd', _('Disable download speed test'));
 		o.default = o.disabled;
 		o.rmempty = true;
 		o.depends('advanced', '1');
+		o.depends('node_test', '0');
 
 		o = s.taboption('advanced', form.Value, 'tp', _('Port'));
 		o.datatype = 'port';
