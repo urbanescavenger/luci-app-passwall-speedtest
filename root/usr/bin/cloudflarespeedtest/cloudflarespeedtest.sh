@@ -27,7 +27,7 @@ echolog() {
 }
 
 function read_config(){
-    get_global_config "enabled" "speed_limit" "custom_url" "threads" "custom_cron_enabled" "custom_cron" "t" "tp" "dt" "dn" "dd" "tl" "tll" "tlr" "ipv6_enabled" "ip_source" "custom_ip_file" "custom_allip" "advanced" "proxy_mode" "github_proxy" "github_proxy_custom" "httping" "cfcolo" "node_test" "node_test_node" "node_test_url" "node_test_count" "node_test_timeout"
+    get_global_config "enabled" "speed_limit" "custom_url" "threads" "custom_cron_enabled" "custom_cron" "t" "tp" "dt" "dn" "dd" "tl" "tll" "tlr" "ipv6_enabled" "ip_source" "custom_ip_file" "custom_allip" "advanced" "proxy_mode" "github_proxy" "github_proxy_custom" "httping" "cfcolo" "node_test" "node_test_node" "node_test_url" "node_test_count" "node_test_timeout" "node_test_probes"
     get_servers_config "ssr_services" "ssr_enabled" "passwall_enabled" "passwall_services" "passwall2_enabled" "passwall2_services" "bypass_enabled" "bypass_services" "vssr_enabled" "vssr_services" "DNS_enabled" "AliDNS_ip_count" "HOST_enabled" "MosDNS_enabled" "MosDNS_ip_count" "openclash_restart" "AstraDNS_enabled" "AstraDNS_config" "AstraDNS_bin"
 }
 
@@ -507,8 +507,8 @@ node_speed_test() {
     local probe_url="${node_test_url:-https://www.google.com/generate_204}"
     local timeout="${node_test_timeout:-5}"
     case "$timeout" in ''|*[!0-9]*) timeout=5 ;; esac
-    # 复用 t 作为每 IP 探测次数（默认 1，与 passwall 单次探测一致；上限 5 避免过慢）
-    local probes="${t:-1}"
+    # 节点模式探测次数独立于 cdnspeedtest 的 t：默认 1（与 passwall 单次探测一致），上限 5
+    local probes="${node_test_probes:-1}"
     case "$probes" in ''|*[!0-9]*) probes=1 ;; esac
     [ "$probes" -ge 1 ] 2>/dev/null || probes=1
     [ "$probes" -le 5 ] 2>/dev/null || probes=5
@@ -534,16 +534,25 @@ node_speed_test() {
             bind=127.0.0.1 socks_port=${socks_port} \
             config_file=${NODE_TEST_FLAG}.json >>$LOG_FILE 2>&1
 
-        # 等待 SOCKS 就绪（passwall 用 sleep 2s，沿用）
-        sleep 2s
-
-        local sent=$probes recv=0 latencies=""
-        local p
-        for p in $(seq 1 $probes); do
-            local res code tpre
+        # 就绪轮询 + 就绪即探测（合并，不盲等、不浪费请求）：
+        # curl 退出码 7=连接拒绝(SOCKS 端口未开)→ sleep 0.3 重试(不计入探测,上限 10 次≈3s)
+        # 非 7=端口已开,这次 curl 即算一次有效探测,解析 code:time_pretransfer
+        local sent=0 recv=0 latencies="" probes_done=0 not_ready=0
+        while [ $probes_done -lt $probes ]; do
+            local res code tpre rc
             res=$(curl -x socks5h://127.0.0.1:${socks_port} -I -skL \
                 --connect-timeout 3 --max-time ${timeout} \
                 -o /dev/null -w "%{http_code}:%{time_pretransfer}" "${probe_url}" 2>/dev/null)
+            rc=$?
+            if [ $rc -eq 7 ]; then
+                not_ready=$((not_ready + 1))
+                [ $not_ready -ge 10 ] && break
+                sleep 0.3
+                continue
+            fi
+            not_ready=0
+            sent=$((sent + 1))
+            probes_done=$((probes_done + 1))
             code="${res%%:*}"
             tpre="${res##*:}"
             case "$code" in

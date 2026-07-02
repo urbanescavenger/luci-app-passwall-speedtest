@@ -409,6 +409,13 @@ return view.extend({
 		o.default = '5';
 		o.rmempty = false;
 
+		o = s.taboption('basic', form.Value, 'node_test_probes', _('Probes per IP'),
+			_('How many curl probes per candidate IP in node mode (independent of the cdnspeedtest latency count <code>t</code>). Each probe is a full SOCKS+curl, so higher values are slower; 1 matches passwall and is fastest.'));
+		o.depends('node_test', '1');
+		o.datatype = 'uinteger';
+		o.default = '1';
+		o.rmempty = false;
+
 		o = s.taboption('basic', form.ListValue, 'github_proxy', _('GitHub Mirror'),
 			_('Only used when downloading the CloudflareSpeedTest core from GitHub releases'));
 		o.value('direct', _('Direct'));

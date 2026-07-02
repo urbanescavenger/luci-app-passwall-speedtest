@@ -21,6 +21,7 @@ config global 'global'
 	option node_test_url 'https://www.google.com/generate_204'
 	option node_test_count '30'
 	option node_test_timeout '5'
+	option node_test_probes '1'
 
 config servers 'servers'
 	option ssr_enabled '0'
