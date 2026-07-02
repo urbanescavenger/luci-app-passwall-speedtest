@@ -416,6 +416,13 @@ return view.extend({
 		o.default = '1';
 		o.rmempty = false;
 
+		o = s.taboption('basic', form.Value, 'node_test_threads', _('Parallel workers'),
+			_('How many candidate IPs to test in parallel. Each worker spawns its own xray/sing-box via a temp clone of the passwall node, so higher values use more memory — on weak routers keep this small (3-5). The source node is not touched during the test; only the fastest IP is written back at the end.'));
+		o.depends('node_test', '1');
+		o.datatype = 'uinteger';
+		o.default = '5';
+		o.rmempty = false;
+
 		o = s.taboption('basic', form.ListValue, 'github_proxy', _('GitHub Mirror'),
 			_('Only used when downloading the CloudflareSpeedTest core from GitHub releases'));
 		o.value('direct', _('Direct'));
