@@ -17,6 +17,26 @@ function addNodeValues(option, nodes) {
 		option.value(nodes[i].value, nodes[i].label);
 }
 
+function tableCss() {
+	return E('style', {}, `
+/* per-node IP list 表：单元格居中、控件字体匹配表格 */
+.cbi-section table.table th,
+.cbi-section table.table td {
+	text-align: center;
+	vertical-align: middle;
+}
+.cbi-section table.table td select,
+.cbi-section table.table td input,
+.cbi-section table.table td .cbi-input-multi,
+.cbi-section table.table td .cbi-multi,
+.cbi-section table.table td .cbi-value-field {
+	font-size: 0.85em;
+	margin: 0 auto;
+	text-align: center;
+}
+`);
+}
+
 return view.extend({
 	load: function() {
 		return Promise.all([
@@ -55,9 +75,9 @@ return view.extend({
 		}
 
 		// 待测速 passwall 节点 + 每节点对应的 CM IP 列表（统一一张表）。
-		// 每加一行 = 新增一个待测节点并指派其 IP 列表；ip_source=online 时才生效，
+		// 仅 ip_source=online（CM 模式）时渲染；每加一行 = 新增一个待测节点并指派其 IP 列表，
 		// 列表为空(默认)的节点回退到第一个 enabled 的 ip_list。
-		if (nodes.passwall && nodes.passwall.exists) {
+		if (nodes.passwall && nodes.passwall.exists && uci.get('passwall-speedtest', 'global', 'ip_source') === 'online') {
 			let ns = m.section(form.TableSection, 'node_ip', _('Passwall worker nodes & per-node IP list'),
 				_('Add one row per to-be-tested passwall node and assign its CM IP list. Only takes effect when IP list source = Online CM source (set on the Plugin Settings page). A node with the default list uses the first enabled CM IP list.'));
 			ns.addremove = true;
@@ -188,6 +208,9 @@ return view.extend({
 		o.rmempty = true;
 		o.depends('AstraDNS_enabled', '1');
 
-		return m.render();
+		return m.render().then(function(node) {
+			node.insertBefore(tableCss(), node.firstChild);
+			return node;
+		});
 	}
 });

@@ -96,6 +96,26 @@ function chartCss() {
 `);
 }
 
+function tableCss() {
+	return E('style', {}, `
+/* CM IP lists / per-node IP list 两张 TableSection 表：单元格居中、控件字体匹配表格 */
+.cbi-section table.table th,
+.cbi-section table.table td {
+	text-align: center;
+	vertical-align: middle;
+}
+.cbi-section table.table td select,
+.cbi-section table.table td input,
+.cbi-section table.table td .cbi-input-multi,
+.cbi-section table.table td .cbi-multi,
+.cbi-section table.table td .cbi-value-field {
+	font-size: 0.85em;
+	margin: 0 auto;
+	text-align: center;
+}
+`);
+}
+
 return view.extend({
 	load: function() {
 		return Promise.all([
@@ -380,7 +400,8 @@ return view.extend({
 		o.default = '24';
 
 		// ── 五个 CM 备选 IP 列表（共享 ip_online_url，仅国家筛选不同）──
-		// 仅在 ip_source=online 时有意义；通过下面 JS 联动显隐。
+		// 仅在 ip_source=online 时渲染（render-time gating：非 online 不创建该段，自然隐藏）。
+		if (uci.get('passwall-speedtest', 'global', 'ip_source') === 'online') {
 		s = m.section(form.TableSection, 'ip_list', _('CM IP lists (per-country)'),
 			_('Define up to 5 CM-source IP lists. All share the online URL above; each filters by its own country set. Assign one list per passwall worker node in the Third-Party tab. Workers without an explicit list use the first enabled list. Only used when IP list source = Online CM source.'));
 		s.addremove = false;
@@ -424,6 +445,7 @@ return view.extend({
 		o.value('AU', _('Australia'));
 		o.value('AE', _('United Arab Emirates'));
 		o.value('ZA', _('South Africa'));
+		} /* end ip_source=online gating */
 
 		s = m.section(form.NamedSection, 'global', 'global', _('Best IP'));
 		s.addremove = false;
@@ -460,24 +482,8 @@ return view.extend({
 			else
 				formNode.appendChild(chartNode);
 
-			// 联动显隐：ip_source != online 时隐藏「CM IP lists」TableSection（跨段无法用 depends）
-			const ipSourceSel = formNode.querySelector('[name$=".ip_source"]') || formNode.querySelector('[id$=".ip_source"]');
-			let ipListSection = null;
-			formNode.querySelectorAll('fieldset.cbi-section').forEach(function(fs) {
-				const t = fs.querySelector('h2, h3, h4, h5, legend');
-				if (t && /CM IP lists/.test(t.textContent)) ipListSection = fs;
-			});
-			function toggleIpLists() {
-				if (!ipListSection) return;
-				const v = ipSourceSel ? ipSourceSel.value : '';
-				ipListSection.style.display = (v === 'online') ? '' : 'none';
-			}
-			if (ipSourceSel) {
-				ipSourceSel.addEventListener('change', toggleIpLists);
-				// LuCI 部分控件会触发 input 事件
-				ipSourceSel.addEventListener('input', toggleIpLists);
-			}
-			toggleIpLists();
+			// CM IP lists 表格格式：单元格居中、控件字体匹配表格紧凑尺寸
+			formNode.insertBefore(tableCss(), formNode.firstChild);
 
 			poll.add(L.bind(this.pollStatus, this, statusNode, actionButton), 3);
 
