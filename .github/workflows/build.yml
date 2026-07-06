@@ -1,4 +1,4 @@
-name: Compile cloudflarespeedtest LuCI App
+name: Compile passwall-speedtest LuCI App
 
 on:
   push:
@@ -28,7 +28,7 @@ jobs:
         id: build
         uses: stevenjoezhang/build-luci-app@v1
         with:
-          package: luci-app-cloudflarespeedtest
+          package: luci-app-passwall-speedtest
           sdk-url: https://archive.openwrt.org/releases/21.02.0/targets/x86/64/openwrt-sdk-21.02.0-x86-64_gcc-8.4.0_musl.Linux-x86_64.tar.xz
           snapsdk-url: ${{ steps.snapsdk.outputs.url }}
 

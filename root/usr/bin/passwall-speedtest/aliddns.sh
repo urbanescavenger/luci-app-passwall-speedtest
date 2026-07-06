@@ -1,6 +1,6 @@
 #!/bin/sh
 
-LOG_FILE='/tmp/cloudflarespeedtest.log'
+LOG_FILE='/tmp/passwall-speedtest.log'
 SCRIPT_DIR="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)"
 
 echolog() {

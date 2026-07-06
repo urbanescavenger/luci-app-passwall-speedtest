@@ -3,7 +3,7 @@
 'require rpc';
 
 const callGetLog = rpc.declare({
-	object: 'cloudflarespeedtest',
+	object: 'passwall-speedtest',
 	method: 'get_log',
 	params: [ 'pos' ],
 	expect: {}
@@ -29,12 +29,12 @@ return view.extend({
 	render: function() {
 		const checkbox = E('input', {
 			type: 'checkbox',
-			id: 'cloudflarespeedtest-log-refresh',
+			id: 'passwall-speedtest-log-refresh',
 			checked: true
 		});
 
 		const textarea = E('textarea', {
-			id: 'cloudflarespeedtest-logview',
+			id: 'passwall-speedtest-logview',
 			'class': 'cbi-input-textarea',
 			style: 'width: 100%',
 			rows: 30,

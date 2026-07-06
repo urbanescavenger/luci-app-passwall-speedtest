@@ -5,17 +5,17 @@ START=99
 USE_PROCD=1
 
 CRON_FILE=/etc/crontabs/root
-CRON_COMMAND=/usr/bin/cloudflarespeedtest/cloudflarespeedtest.sh
+CRON_COMMAND=/usr/bin/passwall-speedtest/passwall-speedtest.sh
 CRON_PATTERN="$CRON_COMMAND start"
 
 service_triggers() {
-	procd_add_reload_trigger "cloudflarespeedtest"
+	procd_add_reload_trigger "passwall-speedtest"
 }
 
 write_cron_if_changed() {
 	local tmp
 
-	tmp="$(mktemp /tmp/cloudflarespeedtest-cron.XXXXXX)" || return 1
+	tmp="$(mktemp /tmp/passwall-speedtest-cron.XXXXXX)" || return 1
 	if [ -f "$CRON_FILE" ]; then
 		grep -Fv "$CRON_PATTERN" "$CRON_FILE" > "$tmp"
 	else
@@ -77,12 +77,12 @@ stop_instance(){
 }
 
 stop_service() {
-	config_load cloudflarespeedtest
+	config_load passwall-speedtest
 	config_foreach stop_instance global
 }
 start_service() {
-	config_load cloudflarespeedtest
-	config_foreach add_cron global	 
+	config_load passwall-speedtest
+	config_foreach add_cron global
 }
 reload_service() {
 	start_service
