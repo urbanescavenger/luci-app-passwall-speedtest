@@ -400,8 +400,7 @@ return view.extend({
 		o.default = '24';
 
 		// ── 五个 CM 备选 IP 列表（共享 ip_online_url，仅国家筛选不同）──
-		// 仅在 ip_source=online 时渲染（render-time gating：非 online 不创建该段，自然隐藏）。
-		if (uci.get('passwall-speedtest', 'global', 'ip_source') === 'online') {
+		// 始终渲染，通过 data-depends 联动 ip_source 动态显隐（见 m.render().then 中的 cbi_d_add 注册）。
 		s = m.section(form.TableSection, 'ip_list', _('CM IP lists (per-country)'),
 			_('Define up to 5 CM-source IP lists. All share the online URL above; each filters by its own country set. Assign one list per passwall worker node in the Third-Party tab. Workers without an explicit list use the first enabled list. Only used when IP list source = Online CM source.'));
 		s.addremove = false;
@@ -445,7 +444,6 @@ return view.extend({
 		o.value('AU', _('Australia'));
 		o.value('AE', _('United Arab Emirates'));
 		o.value('ZA', _('South Africa'));
-		} /* end ip_source=online gating */
 
 		s = m.section(form.NamedSection, 'global', 'global', _('Best IP'));
 		s.addremove = false;
@@ -484,6 +482,33 @@ return view.extend({
 
 			// CM IP lists 表格格式：单元格居中、控件字体匹配表格紧凑尺寸
 			formNode.insertBefore(tableCss(), formNode.firstChild);
+
+			// 联动显隐：ip_source != online 时隐藏「CM IP lists」TableSection
+			// 通过 LuCI CBI 的 data-depends 机制实现，无需页面刷新。
+			// cbi_init() 在 DOMContentLoaded 时已执行，所以这里手动调用 cbi_d_add / cbi_d_update。
+			var ipListContainer = null;
+			formNode.querySelectorAll('h2, h3, h4, h5, legend, .cbi-section-title').forEach(function(h) {
+				if (/CM IP lists/.test(h.textContent)) {
+					ipListContainer = h.closest('.cbi-section') || h.closest('fieldset') || h.closest('div');
+				}
+			});
+			if (ipListContainer) {
+				// cbi_d_update 通过 document.getElementById(entry.id) 查找元素，
+				// 确保容器有 id（LuCI 通常已设置，此处兜底）。
+				if (!ipListContainer.id)
+					ipListContainer.id = 'cbi-passwall-speedtest-ip_list';
+				var ipListIdx = Array.prototype.indexOf.call(ipListContainer.parentNode.children, ipListContainer);
+				ipListContainer.setAttribute('data-depends',
+					JSON.stringify([{'cbid.passwall-speedtest.global.ip_source': 'online'}]));
+				ipListContainer.setAttribute('data-index', String(ipListIdx));
+				if (typeof cbi_d_add === 'function') {
+					cbi_d_add(ipListContainer,
+						{ 'cbid.passwall-speedtest.global.ip_source': 'online' }, ipListIdx);
+				}
+				if (typeof cbi_d_update === 'function') {
+					cbi_d_update();
+				}
+			}
 
 			poll.add(L.bind(this.pollStatus, this, statusNode, actionButton), 3);
 
