@@ -284,6 +284,7 @@ return view.extend({
 		o = s.taboption('basic', form.MultiValue, 'ip_online_regions', _('Country filter'),
 			_('Only keep :443 IPs tagged with the selected countries. Leave none selected to keep all :443 IPs. Default JP/SG/KR for mainland reverse-proxy optimization.'));
 		o.depends('ip_source', 'online');
+		o.default = 'JP SG KR';
 		o.value('JP', _('Japan'));
 		o.value('SG', _('Singapore'));
 		o.value('KR', _('South Korea'));
