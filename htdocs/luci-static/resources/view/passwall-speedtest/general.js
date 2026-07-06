@@ -267,12 +267,51 @@ return view.extend({
 		}, this);
 
 		o = s.taboption('basic', form.ListValue, 'ip_source', _('IP list source'),
-			_('Select the built-in Cloudflare IP list or a custom file used as candidates'));
+			_('Select the built-in Cloudflare IP list, an online CM source, or a custom file used as candidates'));
 		o.value('builtin_ipv4', _('Built-in IPv4 list'));
 		o.value('builtin_ipv6', _('Built-in IPv6 list'));
+		o.value('online', _('Online CM source'));
 		o.value('custom_file', _('Custom file'));
 		o.default = 'builtin_ipv4';
 		o.rmempty = false;
+
+		o = s.taboption('basic', form.Value, 'ip_online_url', _('Online source URL'),
+			_('Source list in <code>IP:PORT#country</code> format. Only :443 entries are kept.'));
+		o.depends('ip_source', 'online');
+		o.default = 'https://zip.cm.edu.kg/all.txt';
+		o.rmempty = false;
+
+		o = s.taboption('basic', form.MultiValue, 'ip_online_regions', _('Country filter'),
+			_('Only keep :443 IPs tagged with the selected countries. Leave none selected to keep all :443 IPs. Default JP/SG/KR for mainland reverse-proxy optimization.'));
+		o.depends('ip_source', 'online');
+		o.value('JP', _('Japan'));
+		o.value('SG', _('Singapore'));
+		o.value('KR', _('South Korea'));
+		o.value('HK', _('Hong Kong'));
+		o.value('TW', _('Taiwan'));
+		o.value('TH', _('Thailand'));
+		o.value('VN', _('Vietnam'));
+		o.value('ID', _('Indonesia'));
+		o.value('PH', _('Philippines'));
+		o.value('MY', _('Malaysia'));
+		o.value('IN', _('India'));
+		o.value('KH', _('Cambodia'));
+		o.value('DE', _('Germany'));
+		o.value('NL', _('Netherlands'));
+		o.value('FR', _('France'));
+		o.value('GB', _('United Kingdom'));
+		o.value('FI', _('Finland'));
+		o.value('SE', _('Sweden'));
+		o.value('CH', _('Switzerland'));
+		o.value('RU', _('Russia'));
+		o.value('TR', _('Turkey'));
+		o.value('UA', _('Ukraine'));
+		o.value('US', _('United States'));
+		o.value('CA', _('Canada'));
+		o.value('BR', _('Brazil'));
+		o.value('AU', _('Australia'));
+		o.value('AE', _('United Arab Emirates'));
+		o.value('ZA', _('South Africa'));
 
 		o = s.taboption('basic', form.Value, 'custom_ip_file', _('Custom IP list file'),
 			_('Enter a local file path, for example: /etc/passwall-speedtest/ip.txt'));
@@ -328,7 +367,7 @@ return view.extend({
 		o.rmempty = false;
 
 		o = s.taboption('basic', form.Value, 'node_test_count', _('Max IPs to test'),
-			_('This mode tests IPs through the node (~3-7s each). Cap the count to avoid long runs; use a smaller IP list or lower this value for faster results.'));
+			_('This mode tests IPs through the node (~3-7s each). Cap the count to avoid long runs; use a smaller IP list or lower this value for faster results. With the online CM source the filtered candidate list may reach hundreds of IPs — raise this value (e.g. 100-300) or only the first N are tested.'));
 		o.datatype = 'uinteger';
 		o.default = '30';
 		o.rmempty = false;

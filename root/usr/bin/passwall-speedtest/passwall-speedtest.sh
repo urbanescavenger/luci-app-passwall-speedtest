@@ -29,7 +29,7 @@ echolog() {
 }
 
 function read_config(){
-    get_global_config "enabled" "custom_cron_enabled" "custom_cron" "tl" "tll" "tlr" "ip_source" "custom_ip_file" "custom_allip" "node_test_node" "node_test_url" "node_test_count" "node_test_timeout" "node_test_probes" "node_test_threads"
+    get_global_config "enabled" "custom_cron_enabled" "custom_cron" "tl" "tll" "tlr" "ip_source" "custom_ip_file" "custom_allip" "ip_online_url" "ip_online_regions" "node_test_node" "node_test_url" "node_test_count" "node_test_timeout" "node_test_probes" "node_test_threads"
     get_servers_config "ssr_services" "ssr_enabled" "passwall_enabled" "passwall_services" "passwall2_enabled" "passwall2_services" "bypass_enabled" "bypass_services" "vssr_enabled" "vssr_services" "DNS_enabled" "AliDNS_ip_count" "HOST_enabled" "MosDNS_enabled" "MosDNS_ip_count" "openclash_restart" "AstraDNS_enabled" "AstraDNS_config" "AstraDNS_bin"
 }
 
@@ -89,8 +89,61 @@ function sort_result(){
     [ -s "${file}.sorted" ] && mv -f "${file}.sorted" "$file" || rm -f "${file}.sorted"
 }
 
+# 从在线 CM 源下载候选 IP 列表。源格式: IP:PORT#国家码 (如 1.2.3.4:443#JP)
+# 只保留 :443 行；若 ip_online_regions 非空则按国家码白名单过滤(空格/逗号分隔,留空=全量 :443)；
+# 去端口去重,只留纯 IP,写入 RESULT_DIR/ip_online.txt 并 echo 该路径。
+# 带下载重试、空检查、行数下限、格式校验(参考仓库根 update_cf_ip.sh)。
+function fetch_online_ip_file(){
+    local src="${ip_online_url:-https://zip.cm.edu.kg/all.txt}"
+    local regions="${ip_online_regions:-}"
+    local timeout=30
+    local min_lines="${CF_MIN_LINES:-50}"
+    local out="${RESULT_DIR}/ip_online.txt"
+    local tmp
+    tmp="$(mktemp "${RESULT_DIR}/ip_online.XXXXXX")" || { echolog "创建在线 IP 临时文件失败"; return 1; }
+
+    echolog "下载在线 IP 列表: $src (地区过滤: ${regions:-全量 :443})"
+    local ok=0 i
+    for i in 1 2 3; do
+        if curl -fsSL --max-time "$timeout" -o "$tmp" "$src" 2>/dev/null; then ok=1; break; fi
+        [ "$i" = 3 ] || echolog "下载失败(第 $i 次),重试..."
+    done
+    [ "$ok" = 1 ] || { echolog "下载失败(重试 3 次): $src"; rm -f "$tmp"; return 1; }
+    [ -s "$tmp" ] || { echolog "下载内容为空"; rm -f "$tmp"; return 1; }
+
+    # 只保留 :443 行;可选国家码白名单过滤;去端口去重,只留纯 IP
+    if [ -n "$regions" ]; then
+        local re
+        re=$(printf '%s' "$regions" | sed 's/[[:space:],]/|/g')
+        { grep ':443#' "$tmp" | grep -E ":443#($re)$" | sed 's/:.*//' | sort -u || true; } > "${tmp}.new"
+    else
+        { grep ':443#' "$tmp" | sed 's/:.*//' | sort -u || true; } > "${tmp}.new"
+    fi
+    mv -f "${tmp}.new" "$tmp"
+
+    local lines good
+    lines=$(wc -l < "$tmp" | tr -d ' ')
+    if [ "$lines" -lt "$min_lines" ]; then
+        echolog "在线 IP 行数过少 ($lines < $min_lines),疑似源异常,中止"
+        rm -f "$tmp"; return 1
+    fi
+    good=$(grep -cE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' "$tmp" || true)
+    if [ "$good" -lt $((lines * 9 / 10)) ]; then
+        echolog "在线 IP 格式异常,合法行 $good/$lines 不足 90%,中止"
+        rm -f "$tmp"; return 1
+    fi
+
+    mkdir -p "$RESULT_DIR"
+    mv -f "$tmp" "$out"
+    echolog "在线 IP 列表就绪: $lines 行 -> $out"
+    echo "$out"
+}
+
 function select_ip_file(){
     case "${ip_source:-}" in
+        online)
+            fetch_online_ip_file
+            ;;
         builtin_ipv4)
             echo "$IPV4_TXT"
             ;;
