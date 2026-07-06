@@ -58,8 +58,10 @@ function migrate_ip_online_regions(){
 # 用 `uci show` 解析，避免 config_load 扰动 passwall 自身的配置加载状态（config_n_get 依赖它）。
 # node id 形如 cfg0a1b2c，是合法 shell 变量后缀。
 NODE_IP_MAP_LOADED=0
+NODE_IP_WORKERS=""
 function read_node_ip_map(){
     [ "$NODE_IP_MAP_LOADED" = "1" ] && return 0
+    NODE_IP_WORKERS=""
     local line _node=""
     while IFS= read -r line; do
         # 形如 passwall-speedtest.@node_ip[N].node='cfg0a1b2c' / .ip_list='list2'
@@ -67,6 +69,8 @@ function read_node_ip_map(){
             *".node="*)
                 _node="${line#*.node=}"
                 _node="${_node#\'}"; _node="${_node%\'}"
+                # 每行 node 字段 = 一个待测 worker 节点（统一表的 worker 来源）
+                [ -n "$_node" ] && NODE_IP_WORKERS="$NODE_IP_WORKERS $_node"
                 ;;
             *".ip_list="*)
                 local _list="${line#*.ip_list=}"
@@ -80,6 +84,7 @@ function read_node_ip_map(){
     done <<EOF
 $(uci show passwall-speedtest 2>/dev/null | grep '@node_ip\[')
 EOF
+    NODE_IP_WORKERS="${NODE_IP_WORKERS# }"
     NODE_IP_MAP_LOADED=1
 }
 
@@ -461,7 +466,6 @@ node_speed_test() {
         # online CM 源：一次下载原始列表，按各 ip_list 的 regions 分别过滤成 ip_list_<N>.txt
         migrate_ip_online_regions
         fetch_online_raw || return 1
-        read_node_ip_map
         compute_default_ip_list
         local _n _e
         for _n in 1 2 3 4 5; do
@@ -474,6 +478,10 @@ node_speed_test() {
         [ -f "$selected_ip_file" ] || { echolog "候选 IP 列表文件不存在: $selected_ip_file"; return 1; }
         ip_source_mode="file"
     fi
+
+    # 读取 node_ip 段（统一表：每行=待测节点+其 CM 列表）→ NODE_IP_WORKERS + node→ip_list 映射。
+    # 所有模式都要读（worker 来源是 node_ip）；仅在线模式才用 per-node 列表过滤。
+    read_node_ip_map
 
     # 取某 worker 的候选 IP（grep 去注释空行 + head -n count）。无 echolog、可在 $(..) 内用。
     get_worker_ips(){
@@ -499,11 +507,13 @@ node_speed_test() {
     NODE_TESTED_WORKERS=""
     trap node_test_cleanup EXIT INT TERM
 
-    # ── 检测 worker：第三方设置里选的 passwall 节点 ──
+    # ── 检测 worker：第三方设置「Passwall worker nodes & per-node IP list」表里选的节点 ──
+    # 主源 = node_ip 段的 node 字段；兼容旧配置里的 passwall_services 多选。
     local workers_raw=""
-    if [ "x${passwall_enabled:-0}" = "x1" ] && [ -n "${passwall_services:-}" ]; then
+    if [ "x${passwall_enabled:-0}" = "x1" ]; then
         local _w _seen=""
-        for _w in ${passwall_services}; do
+        for _w in ${NODE_IP_WORKERS:-} ${passwall_services:-}; do
+            [ -n "$_w" ] || continue
             case " $_seen " in *" $_w "*) ;; *) _seen="$_seen $_w"; workers_raw="$workers_raw $_w"; ;; esac
         done
     fi
@@ -748,19 +758,11 @@ function astra_dns_ip() {
 }
 
 function passwall_best_ip(){
+    # 走节点测速模式下，每个 passwall worker 在 node_speed_test 里已各自写入其 CM 列表内的最优 IP
+    # （见 NODE_TESTED_WORKERS 的逐节点写回）。不再用全局最优 IP 覆写——否则按节点选 CM 列表的意义
+    # 被抹掉，且会误把 SOCKS/无 address 等被跳过的无效节点也覆写成 CF IP。故此处保留为 no-op。
     if [ "x${passwall_enabled}" == "x1" ] ;then
-        echolog "设置passwall IP"
-        # 跳过本次已实测的 worker：它们在 node_speed_test 里已各自写入自己列表内的最优 IP，
-        # 不能被全局最优 IP 覆盖（否则按节点选 CM 列表的意义被抹掉）。
-        # 未实测的 passwall_services 节点（如 SOCKS/无 address 被跳过的）维持原状，不再被误覆写。
-        local tested="${NODE_TESTED_WORKERS:-}"
-        for ssrname in $passwall_services
-        do
-            case " $tested " in *" $ssrname "*) echolog "跳过 $ssrname（已写入其 CM 列表内的最优 IP）"; continue ;; esac
-            echo $ssrname
-            uci set passwall.$ssrname.address="${bestip}"
-        done
-        uci commit passwall
+        echolog "passwall 各 worker 节点已按各自 CM 列表写入最优 IP，跳过全局覆写"
     fi
 }
 

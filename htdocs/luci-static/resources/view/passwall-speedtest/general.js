@@ -461,10 +461,10 @@ return view.extend({
 				formNode.appendChild(chartNode);
 
 			// 联动显隐：ip_source != online 时隐藏「CM IP lists」TableSection（跨段无法用 depends）
-			const ipSourceSel = formNode.querySelector('[name="cbid.passwall-speedtest.global.ip_source"]');
+			const ipSourceSel = formNode.querySelector('[name$=".ip_source"]') || formNode.querySelector('[id$=".ip_source"]');
 			let ipListSection = null;
 			formNode.querySelectorAll('fieldset.cbi-section').forEach(function(fs) {
-				const t = fs.querySelector('h3, legend');
+				const t = fs.querySelector('h2, h3, h4, h5, legend');
 				if (t && /CM IP lists/.test(t.textContent)) ipListSection = fs;
 			});
 			function toggleIpLists() {
@@ -472,7 +472,11 @@ return view.extend({
 				const v = ipSourceSel ? ipSourceSel.value : '';
 				ipListSection.style.display = (v === 'online') ? '' : 'none';
 			}
-			if (ipSourceSel) ipSourceSel.addEventListener('change', toggleIpLists);
+			if (ipSourceSel) {
+				ipSourceSel.addEventListener('change', toggleIpLists);
+				// LuCI 部分控件会触发 input 事件
+				ipSourceSel.addEventListener('input', toggleIpLists);
+			}
 			toggleIpLists();
 
 			poll.add(L.bind(this.pollStatus, this, statusNode, actionButton), 3);

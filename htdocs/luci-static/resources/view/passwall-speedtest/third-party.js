@@ -52,29 +52,26 @@ return view.extend({
 
 			o = s.taboption('passwalltab', form.Flag, 'passwall_enabled', _('Passwall Enabled'));
 			o.rmempty = true;
-
-			o = s.taboption('passwalltab', form.DynamicList, 'passwall_services',
-				_('Passwall Servers'), _('Please select a service'));
-			addNodeValues(o, nodes.passwall.nodes);
-			o.depends('passwall_enabled', '1');
-			o.forcewrite = true;
 		}
 
-		// 每个 passwall worker 节点可指派一个 CM IP 列表（仅 ip_source=online 时生效）。
-		// 未列出的 worker 回退到第一个 enabled 的 ip_list。
+		// 待测速 passwall 节点 + 每节点对应的 CM IP 列表（统一一张表）。
+		// 每加一行 = 新增一个待测节点并指派其 IP 列表；ip_source=online 时才生效，
+		// 列表为空(默认)的节点回退到第一个 enabled 的 ip_list。
 		if (nodes.passwall && nodes.passwall.exists) {
-			let ns = m.section(form.TableSection, 'node_ip', _('Per-node IP list (CM source)'),
-				_('Optional: assign one of the 5 CM IP lists (defined on the Plugin Settings page) to each passwall worker node. Only takes effect when IP list source = Online CM source. Worker nodes not listed here use the first enabled CM IP list.'));
+			let ns = m.section(form.TableSection, 'node_ip', _('Passwall worker nodes & per-node IP list'),
+				_('Add one row per to-be-tested passwall node and assign its CM IP list. Only takes effect when IP list source = Online CM source (set on the Plugin Settings page). A node with the default list uses the first enabled CM IP list.'));
 			ns.addremove = true;
 			ns.anonymous = true;
 			ns.nodescriptions = true;
 
-			o = ns.option(form.ListValue, 'node', _('Passwall node'));
+			o = ns.option(form.ListValue, 'node', _('Passwall node'),
+				_('Select a passwall node as a speedtest worker.'));
 			o.value('', _('-- Please choose --'));
 			addNodeValues(o, nodes.passwall.nodes);
 			o.rmempty = false;
 
-			o = ns.option(form.ListValue, 'ip_list', _('CM IP list'));
+			o = ns.option(form.ListValue, 'ip_list', _('CM IP list'),
+				_('Which CM IP list to test this node against. Default = first enabled list.'));
 			o.value('', _('-- Default (first enabled) --'));
 			for (let n = 1; n <= 5; n++) {
 				let nm = uci.get('passwall-speedtest', 'list' + n, 'name') || '';
