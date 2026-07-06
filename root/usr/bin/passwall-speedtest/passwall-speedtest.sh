@@ -91,9 +91,13 @@ function sort_result(){
 
 # 从在线 CM 源下载候选 IP 列表。源格式: IP:PORT#国家码 (如 1.2.3.4:443#JP)
 # 只保留 :443 行；若 ip_online_regions 非空则按国家码白名单过滤(空格/逗号分隔,留空=全量 :443)；
-# 去端口去重,只留纯 IP,写入 RESULT_DIR/ip_online.txt 并 echo 该路径。
+# 去端口去重,只留纯 IP,写入 RESULT_DIR/ip_online.txt 并把该路径写入全局变量 ONLINE_IP_FILE。
 # 带下载重试、空检查、行数下限、格式校验(参考仓库根 update_cf_ip.sh)。
+# 注意:本函数会被 node_speed_test 直接调用(不在 $(...) 内),故 echolog 的 stdout 日志安全；
+# 路径不通过 echo 返回,避免被 command substitution 捕获日志行污染变量。
+ONLINE_IP_FILE=""
 function fetch_online_ip_file(){
+    ONLINE_IP_FILE=""
     local src="${ip_online_url:-https://zip.cm.edu.kg/all.txt}"
     local regions="${ip_online_regions:-}"
     local timeout=30
@@ -135,15 +139,13 @@ function fetch_online_ip_file(){
 
     mkdir -p "$RESULT_DIR"
     mv -f "$tmp" "$out"
+    ONLINE_IP_FILE="$out"
     echolog "在线 IP 列表就绪: $lines 行 -> $out"
-    echo "$out"
+    return 0
 }
 
 function select_ip_file(){
     case "${ip_source:-}" in
-        online)
-            fetch_online_ip_file
-            ;;
         builtin_ipv4)
             echo "$IPV4_TXT"
             ;;
@@ -348,7 +350,13 @@ node_speed_test() {
     [ "$threads" -ge 0 ] 2>/dev/null || threads=5
 
     local selected_ip_file
-    selected_ip_file="$(select_ip_file)"
+    if [ "${ip_source:-}" = "online" ]; then
+        # online 源:fetch 直接调用(不在 $(..) 内),避免 echolog 日志行污染路径变量
+        fetch_online_ip_file || return 1
+        selected_ip_file="${ONLINE_IP_FILE}"
+    else
+        selected_ip_file="$(select_ip_file)"
+    fi
     [ -f "$selected_ip_file" ] || { echolog "候选 IP 列表文件不存在: $selected_ip_file"; return 1; }
     local count="${node_test_count:-30}"
     case "$count" in ''|*[!0-9]*) count=30 ;; esac
