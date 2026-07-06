@@ -330,10 +330,36 @@ node_test_cleanup() {
         fi
     fi
     rm -f "${NT_ORIG_FILE}" 2>/dev/null
+    # 清理首完成即停用的完成标记（覆盖单节点 inline 路径与中断退出残留）
+    rm -f "${RESULT_DIR}"/result.csv.tmp.*.done "${RESULT_DIR}"/result.csv.tmp.*.end 2>/dev/null
 }
 
 nt_lock_acquire() { while ! mkdir "${NT_LOCKDIR}" 2>/dev/null; do sleep 0.1; done; }
 nt_lock_release() { rmdir "${NT_LOCKDIR}" 2>/dev/null; }
+
+# 扫描进行中的 worker（全局 NT_RUNNING = 空格分隔的 pid:worker 列表）：
+#   .done 存在 → 该 worker 完成且有有效结果，wait 收尸并从 NT_RUNNING 移除，记为停止触发；
+#   .end  存在 → 该 worker 完成但无有效结果，wait 收尸并移除（仅释放并发槽，不触发停止）；
+#   都没有 → 仍在运行，保留。
+# 返回 0 = 检测到 .done（触发首完成即停），1 = 无。
+# pid:worker 拆分用 :* 模式（不含 worker id），避免 worker id 含 [] 时 glob 误匹配。
+nt_scan_running() {
+    local _new="" _t _pid _w _rfile _stop=0
+    for _t in $NT_RUNNING; do
+        _pid="${_t%%:*}"; _w="${_t#*:}"
+        _rfile="${RESULT_DIR}/result.csv.tmp.$_w"
+        if [ -f "${_rfile}.done" ]; then
+            _stop=1
+            wait "$_pid" 2>/dev/null
+        elif [ -f "${_rfile}.end" ]; then
+            wait "$_pid" 2>/dev/null
+        else
+            _new="${_new:+$_new }$_t"
+        fi
+    done
+    NT_RUNNING="${_new# }"
+    [ "$_stop" = "1" ]
+}
 
 # 单个 worker：通过节点 $2 的链路测全部候选 IP（$5），保留行写入结果文件 $4。
 # ash 子 shell 里 local 可用（已验证）。uci set+commit 经锁串行化；run_socks+探测在锁外并行。
@@ -424,6 +450,12 @@ node_test_worker() {
     done
     # 本 worker 结果按延迟升序排（首行即该节点最优）
     sort_result "$_rfile" latency
+    # 完成标记：有有效结果写 .done（触发首个有效结果即停），否则写 .end（仅释放并发槽）
+    if [ -n "$(first_result_ip "$_rfile")" ]; then
+        : > "${_rfile}.done"
+    else
+        : > "${_rfile}.end"
+    fi
 }
 
 node_speed_test() {
@@ -546,28 +578,48 @@ node_speed_test() {
             echolog "提示：测速期间所有 worker 节点的 address 会被反复改写，这些节点会短暂抖动，测完各写各的最优 IP"
             # 记录实测过的 worker 集合，供 ip_replace/passwall_best_ip 跳过（保留各节点自己的最优 IP）
             NODE_TESTED_WORKERS="$valid_workers"
-            # 分批并行：每批 threads 个 worker，批内 background、批间 wait
-            local launched=0 batch
+            # 并发上限 + 首个有效结果即停：维持 threads 个并发，轮询各 worker 完成标记；
+            # 任一 worker 跑完全部候选 IP 且保留≥1 个有效 IP（写 .done）时，立即终止其余
+            # worker，跳到合并阶段按已有（含被杀 worker 的部分）结果排序。无有效结果的
+            # worker 完成（写 .end）仅释放并发槽，不触发停止。
+            echolog "提示：首个 worker 测出有效结果即终止其余，按已有结果排序"
+            NT_RUNNING=""
+            local launched=0 _stop=0 _rfile _t _port _wips _wtot
             [ "$threads" -ge 1 ] 2>/dev/null || threads=$widx
             for _w in $valid_workers; do
+                [ "$_stop" = "1" ] && break
+                # 达到并发上限：轮询回收已完成 worker 释放空位，或首个有效结果触发停止
+                while [ "$(echo $NT_RUNNING | wc -w)" -ge "$threads" ] && [ "$_stop" != "1" ]; do
+                    if nt_scan_running; then _stop=1; break; fi
+                    [ "$(echo $NT_RUNNING | wc -w)" -ge "$threads" ] && sleep 0.5
+                done
+                [ "$_stop" = "1" ] && break
                 launched=$((launched + 1))
-                local _rfile="${RESULT_DIR}/result.csv.tmp.$_w"
+                _rfile="${RESULT_DIR}/result.csv.tmp.$_w"
+                rm -f "${_rfile}.done" "${_rfile}.end" 2>/dev/null
                 # 端口确定性分配：48900 + idx - 1（每 worker 固定端口，复用于其所有 IP）
-                local _port=$((48900 + launched - 1))
+                _port=$((48900 + launched - 1))
                 # 按 worker 取其对应 CM IP 列表（在线模式 per-worker；非在线模式共享 selected_ip_file）
-                local _wips
                 _wips=$(get_worker_ips "$_w") || { echolog "worker 节点 $_w 候选 IP 不可用，跳过"; continue; }
-                local _wtot
                 _wtot=$(echo "$_wips" | grep -c .)
                 [ "$_wtot" -gt 0 ] || { echolog "worker 节点 $_w 候选 IP 为空，跳过"; continue; }
                 [ "$_wtot" -lt "$count" ] && echolog "worker 节点 $_w 候选 IP $_wtot < $count（其 CM 列表偏小）"
                 node_test_worker "$launched" "$_w" "" "$_rfile" "$_wips" "$probe_url" "$timeout" "$probes" "$_port" "${NODE_TEST_FLAG_BASE}_$launched" &
-                # 每 threads 个或最后一个，等本批完成
-                batch=$((launched % threads))
-                if [ "$batch" -eq 0 ] || [ "$launched" -ge "$widx" ]; then
-                    wait
-                fi
+                NT_RUNNING="${NT_RUNNING:+$NT_RUNNING }$!:${_w}"
             done
+            # 排空仍运行的 worker（无提前停止时正常完成路径）
+            while [ -n "$NT_RUNNING" ] && [ "$_stop" != "1" ]; do
+                if nt_scan_running; then _stop=1; break; fi
+                [ -n "$NT_RUNNING" ] && [ "$_stop" != "1" ] && sleep 0.5
+            done
+            # 提前停止：终止残余 worker 并收尸
+            if [ "$_stop" = "1" ]; then
+                echolog "首个有效结果 worker 完成，终止其余 worker，按已有结果排序"
+                for _t in $NT_RUNNING; do kill -9 "${_t%%:*}" 2>/dev/null; done
+                wait 2>/dev/null
+            fi
+            NT_RUNNING=""
+            rm -f "${RESULT_DIR}"/result.csv.tmp.*.done "${RESULT_DIR}"/result.csv.tmp.*.end 2>/dev/null
             # 各 worker 写回各自最优（串行，单进程无锁）
             local merged="$(mktemp "${RESULT_DIR}/result.csv.merged.XXXXXX")"
             echo "IP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码" > "$merged"
@@ -575,6 +627,9 @@ node_speed_test() {
             while read -r mi mw morig; do
                 [ -n "$mw" ] || continue
                 mwfile="${RESULT_DIR}/result.csv.tmp.$mw"
+                # 被杀 worker 的部分结果文件未经其自身排序；这里补排，使 first_result_ip
+                # 取到该 worker 最低延迟 IP 写回 passwall address。对已完成 worker 幂等。
+                sort_result "$mwfile" latency
                 mwbest=$(first_result_ip "$mwfile")
                 if [ -n "$mwbest" ]; then
                     uci set passwall.${mw}.address="${mwbest}"
@@ -583,7 +638,8 @@ node_speed_test() {
                     uci set passwall.${mw}.address="${morig}"
                     echolog "走节点测速 [${mw}] 结果为空，恢复原 address"
                 fi
-                sed '1d' "$mwfile" 2>/dev/null >> "$merged"
+                # awk 过滤丢掉被杀 worker kill -9 中途截断的脏行（NF<7），正常 7 列行等价
+                sed '1d' "$mwfile" 2>/dev/null | awk -F, 'NF>=7 && $1!=""' >> "$merged"
                 rm -f "$mwfile"
             done < "$NT_ORIG_FILE"
             uci commit passwall
