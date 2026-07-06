@@ -1,7 +1,7 @@
 # luci-app-passwall-speedtest
 
-[![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/stevenjoezhang/luci-app-cloudflarespeedtest/build.yml?style=for-the-badge&logo=GitHub)](https://github.com/stevenjoezhang/luci-app-cloudflarespeedtest/actions/workflows/build.yml)
-[![GitHub release (latest by date)](https://img.shields.io/github/v/release/stevenjoezhang/luci-app-cloudflarespeedtest?style=for-the-badge)](https://github.com/stevenjoezhang/luci-app-cloudflarespeedtest/releases)
+[![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/urbanescavenger/luci-app-passwall-speedtest/build.yml?style=for-the-badge&logo=GitHub)](https://github.com/urbanescavenger/luci-app-passwall-speedtest/actions/workflows/build.yml)
+[![GitHub release (latest by date)](https://img.shields.io/github/v/release/urbanescavenger/luci-app-passwall-speedtest?style=for-the-badge)](https://github.com/urbanescavenger/luci-app-passwall-speedtest/releases)
 
 [English](README.md)
 
@@ -64,7 +64,7 @@
 
 ## 安装与使用
 
-1.  从 [Releases](https://github.com/stevenjoezhang/luci-app-cloudflarespeedtest/releases) 页面下载最新的 `.ipk` 或 `.apk` 文件。
+1.  从 [Releases](https://github.com/urbanescavenger/luci-app-passwall-speedtest/releases) 页面下载最新的 `.ipk` 或 `.apk` 文件。
 2.  上传到路由器并安装：
     ```bash
     opkg install luci-app-passwall-speedtest_*.ipk

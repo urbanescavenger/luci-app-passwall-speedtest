@@ -236,7 +236,7 @@ return view.extend({
 
 		m = new form.Map('passwall-speedtest', _('PassWall Speed Test'),
 			_('Schedules and runs a PassWall node-based Cloudflare IP latency test, writing the fastest IP back to the selected passwall nodes and other integrations') +
-			'<br><a href="https://github.com/stevenjoezhang/luci-app-cloudflarespeedtest" target="_blank">⭐ ' + _('Star on GitHub') + '</a>');
+			'<br><a href="https://github.com/urbanescavenger/luci-app-passwall-speedtest" target="_blank">⭐ ' + _('Star on GitHub') + '</a>');
 
 		s = m.section(form.NamedSection, 'global', 'global');
 		s.addremove = false;

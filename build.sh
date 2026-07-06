@@ -26,7 +26,7 @@ Maintainer: mingxiaoyu <fengying0347@163.com>
 Section: luci
 Priority: optional
 Description: LuCI support for PassWall-based Cloudflare IP speed test
-Source: https://github.com/stevenjoezhang/luci-app-cloudflarespeedtest
+Source: https://github.com/urbanescavenger/luci-app-passwall-speedtest
 EOF
 cat > $workdir/luci-app-passwall-speedtest/CONTROL/postinst <<EOF
 #!/bin/sh

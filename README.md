@@ -1,7 +1,7 @@
 # luci-app-passwall-speedtest
 
-[![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/stevenjoezhang/luci-app-cloudflarespeedtest/build.yml?style=for-the-badge&logo=GitHub)](https://github.com/stevenjoezhang/luci-app-cloudflarespeedtest/actions/workflows/build.yml)
-[![GitHub release (latest by date)](https://img.shields.io/github/v/release/stevenjoezhang/luci-app-cloudflarespeedtest?style=for-the-badge)](https://github.com/stevenjoezhang/luci-app-cloudflarespeedtest/releases)
+[![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/urbanescavenger/luci-app-passwall-speedtest/build.yml?style=for-the-badge&logo=GitHub)](https://github.com/urbanescavenger/luci-app-passwall-speedtest/actions/workflows/build.yml)
+[![GitHub release (latest by date)](https://img.shields.io/github/v/release/urbanescavenger/luci-app-passwall-speedtest?style=for-the-badge)](https://github.com/urbanescavenger/luci-app-passwall-speedtest/releases)
 
 [中文说明](README.CN.md)
 
@@ -64,7 +64,7 @@ Results are saved to `/tmp/passwall-speedtest/result.csv` with 10 rolling histor
 
 ## Installation
 
-1.  Download the latest `.ipk` or `.apk` file from [Releases](https://github.com/stevenjoezhang/luci-app-cloudflarespeedtest/releases).
+1.  Download the latest `.ipk` or `.apk` file from [Releases](https://github.com/urbanescavenger/luci-app-passwall-speedtest/releases).
 2.  Install it on your router:
     ```bash
     opkg install luci-app-passwall-speedtest_*.ipk

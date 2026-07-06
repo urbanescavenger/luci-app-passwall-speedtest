@@ -13,7 +13,7 @@ LUCI_PKGARCH:=all
 PKG_VERSION:=2.0
 PKG_RELEASE:=0
 PKG_LICENSE:=AGPL-3.0
-PKG_MAINTAINER:=<https://github.com/stevenjoezhang/luci-app-cloudflarespeedtest>
+PKG_MAINTAINER:=<https://github.com/urbanescavenger/luci-app-passwall-speedtest>
 
 define Package/$(PKG_NAME)/conffiles
 /etc/config/passwall-speedtest
