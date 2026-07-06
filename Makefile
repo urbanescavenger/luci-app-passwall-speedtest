@@ -5,18 +5,18 @@
 
 include $(TOPDIR)/rules.mk
 
-PKG_NAME:=luci-app-cloudflarespeedtest
+PKG_NAME:=luci-app-passwall-speedtest
 
-LUCI_TITLE:=LuCI support for Cloudflare Speed Test
-LUCI_DEPENDS:=+!wget&&!curl:curl
+LUCI_TITLE:=LuCI support for PassWall-based Cloudflare IP speed test
+LUCI_DEPENDS:=+curl
 LUCI_PKGARCH:=all
-PKG_VERSION:=1.25
+PKG_VERSION:=2.0
 PKG_RELEASE:=0
 PKG_LICENSE:=AGPL-3.0
 PKG_MAINTAINER:=<https://github.com/stevenjoezhang/luci-app-cloudflarespeedtest>
 
 define Package/$(PKG_NAME)/conffiles
-/etc/config/cloudflarespeedtest
+/etc/config/passwall-speedtest
 endef
 
 include $(TOPDIR)/feeds/luci/luci.mk

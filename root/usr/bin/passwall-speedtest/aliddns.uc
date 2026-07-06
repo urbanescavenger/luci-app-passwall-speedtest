@@ -2,7 +2,7 @@
 
 const fs = require('fs');
 
-const LOG_FILE = '/tmp/cloudflarespeedtest.log';
+const LOG_FILE = '/tmp/passwall-speedtest.log';
 const ENDPOINT = 'https://alidns.aliyuncs.com/';
 
 function command_output(cmd) {

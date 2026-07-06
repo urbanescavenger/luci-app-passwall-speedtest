@@ -7,37 +7,37 @@
 'require uci';
 
 const callStatus = rpc.declare({
-	object: 'cloudflarespeedtest',
+	object: 'passwall-speedtest',
 	method: 'status',
 	expect: {}
 });
 
 const callStart = rpc.declare({
-	object: 'cloudflarespeedtest',
+	object: 'passwall-speedtest',
 	method: 'start',
 	expect: {}
 });
 
 const callStop = rpc.declare({
-	object: 'cloudflarespeedtest',
+	object: 'passwall-speedtest',
 	method: 'stop',
 	expect: {}
 });
 
 const callHistory = rpc.declare({
-	object: 'cloudflarespeedtest',
+	object: 'passwall-speedtest',
 	method: 'get_history',
 	expect: { history: [] }
 });
 
 const callBestResult = rpc.declare({
-	object: 'cloudflarespeedtest',
+	object: 'passwall-speedtest',
 	method: 'get_best_result',
 	expect: { content: '' }
 });
 
 const callListNodes = rpc.declare({
-	object: 'cloudflarespeedtest',
+	object: 'passwall-speedtest',
 	method: 'list_nodes',
 	expect: {}
 });
@@ -66,7 +66,7 @@ function script(src) {
 
 function chartCss() {
 	return E('style', {}, `
-.cloudflarespeedtest-chart-container {
+.passwall-speedtest-chart-container {
 	--card-bg: #f8f8f8;
 	--text-color: #222;
 	--card-shadow: 0 2px 6px rgba(0,0,0,0.1);
@@ -81,25 +81,14 @@ function chartCss() {
 }
 
 @media (prefers-color-scheme: dark) {
-	.cloudflarespeedtest-chart-container {
+	.passwall-speedtest-chart-container {
 		--card-bg: #282828;
 		--text-color: #e6eef6;
 		--card-shadow: 0 2px 6px rgba(0,0,0,0.6);
 	}
 }
 
-.cloudflarespeedtest-chart-row {
-	display: flex;
-	gap: 30px;
-}
-
-@media (max-width: 767px) {
-	.cloudflarespeedtest-chart-row {
-		flex-direction: column;
-	}
-}
-
-.cloudflarespeedtest-chart-container canvas {
+.passwall-speedtest-chart-container canvas {
 	display: block;
 	width: 100%;
 	height: 300px;
@@ -110,7 +99,7 @@ function chartCss() {
 return view.extend({
 	load: function() {
 		return Promise.all([
-			uci.load('cloudflarespeedtest'),
+			uci.load('passwall-speedtest'),
 			callStatus(),
 			callBestResult(),
 			callHistory(),
@@ -128,7 +117,7 @@ return view.extend({
 		node.replaceChildren(
 			E('em', {}, [
 				E('b', { style: 'color:%s'.format(running ? 'green' : 'red') },
-					_('Cloudflare Speed Test') + ' ' + (running ? _('RUNNING') : _('NOT RUNNING')))
+					_('PassWall Speed Test') + ' ' + (running ? _('RUNNING') : _('NOT RUNNING')))
 			]),
 			' ',
 			E('em', {}, [
@@ -165,15 +154,13 @@ return view.extend({
 		if (!root || !window.Chart || !dataPoints || !dataPoints.length)
 			return;
 
-		const latencyCanvas = root.querySelector('#cloudflarespeedtest-latency-chart');
-		const speedCanvas = root.querySelector('#cloudflarespeedtest-speed-chart');
+		const latencyCanvas = root.querySelector('#passwall-speedtest-latency-chart');
 
-		if (!latencyCanvas || !speedCanvas)
+		if (!latencyCanvas)
 			return;
 
 		const labels = dataPoints.map(d => d.time);
 		const latencyData = dataPoints.map(d => d.latency);
-		const speedData = dataPoints.map(d => d.speed);
 
 		const tooltip = unitText => ({
 			mode: 'index',
@@ -236,37 +223,6 @@ return view.extend({
 				}
 			}
 		});
-
-		new Chart(speedCanvas, {
-			type: 'line',
-			data: {
-				labels: labels,
-				datasets: [{
-					label: _('Download speed'),
-					data: speedData,
-					borderColor: 'rgba(255, 159, 64, 1)',
-					backgroundColor: 'rgba(255, 159, 64, 0.2)',
-					tension: 0.3,
-					fill: false,
-					pointRadius: 4
-				}]
-			},
-			options: {
-				responsive: true,
-				interaction: tooltip('MB/s'),
-				plugins: {
-					tooltip: tooltip('MB/s'),
-					legend: { position: 'top' }
-				},
-				scales: {
-					x: timeScale,
-					y: {
-						type: 'linear',
-						title: { display: true, text: _('Speed') + ' (MB/s)' }
-					}
-				}
-			}
-		});
 	},
 
 	render: function(data) {
@@ -278,8 +234,8 @@ return view.extend({
 		const nodes = data[4] || {};
 		const passwallNodes = (nodes.passwall && nodes.passwall.nodes) || [];
 
-		m = new form.Map('cloudflarespeedtest', _('Cloudflare Speed Test'),
-			_('Schedules and runs CloudflareSpeedTest with the selected IP list, automatically applying the fastest IPs to supported integrations') +
+		m = new form.Map('passwall-speedtest', _('PassWall Speed Test'),
+			_('Schedules and runs a PassWall node-based Cloudflare IP latency test, writing the fastest IP back to the selected passwall nodes and other integrations') +
 			'<br><a href="https://github.com/stevenjoezhang/luci-app-cloudflarespeedtest" target="_blank">⭐ ' + _('Star on GitHub') + '</a>');
 
 		s = m.section(form.NamedSection, 'global', 'global');
@@ -288,7 +244,7 @@ return view.extend({
 		s.tab('basic', _('Basic Settings'));
 
 		o = s.taboption('basic', form.Button, '_speedtest', _('Speed test'),
-			_('Test latency and speed for all IPs in the selected CDN or website list, then apply the fastest IP (IPv4 + IPv6 supported)'));
+			_('Probes candidate Cloudflare IPs through the selected passwall node(s) via a local SOCKS and measures HTTP HEAD latency (<code>time_pretransfer</code>). Only latency is measured (no download bandwidth). The fastest IP is written back to each passwall worker node.'));
 		this.updateButton(o, status.running);
 		actionButton = o;
 		o.onclick = L.bind(function(ev, sectionId) {
@@ -298,11 +254,11 @@ return view.extend({
 			return callStatus().then(function(st) {
 				return st.running ? callStop() : callStart().then(function() {
 					window.setTimeout(function() {
-						window.location = L.url('admin/services/cloudflarespeedtest/logread');
+						window.location = L.url('admin/services/passwall-speedtest/logread');
 					}, 500);
 				});
 			}).then(L.bind(function() {
-				return this.pollStatus(document.getElementById('cloudflarespeedtest-status'), button);
+				return this.pollStatus(document.getElementById('passwall-speedtest-status'), button);
 			}, this)).catch(function(e) {
 				ui.addNotification(null, E('p', {}, e.message));
 			}).finally(function() {
@@ -311,25 +267,15 @@ return view.extend({
 		}, this);
 
 		o = s.taboption('basic', form.ListValue, 'ip_source', _('IP list source'),
-			_('Select the IP list used by CloudflareSpeedTest'));
+			_('Select the built-in Cloudflare IP list or a custom file used as candidates'));
 		o.value('builtin_ipv4', _('Built-in IPv4 list'));
 		o.value('builtin_ipv6', _('Built-in IPv6 list'));
 		o.value('custom_file', _('Custom file'));
 		o.default = 'builtin_ipv4';
 		o.rmempty = false;
-		o.cfgvalue = function(sectionId) {
-			const value = uci.get('cloudflarespeedtest', sectionId, 'ip_source');
-
-			if (value)
-				return value;
-
-			return uci.get('cloudflarespeedtest', sectionId, 'ipv6_enabled') == '1'
-				? 'builtin_ipv6'
-				: 'builtin_ipv4';
-		};
 
 		o = s.taboption('basic', form.Value, 'custom_ip_file', _('Custom IP list file'),
-			_('Enter a local file path, for example: /etc/cloudflarespeedtest/ip.txt'));
+			_('Enter a local file path, for example: /etc/passwall-speedtest/ip.txt'));
 		o.depends('ip_source', 'custom_file');
 		o.rmempty = true;
 		o.validate = function(sectionId, value) {
@@ -342,51 +288,37 @@ return view.extend({
 		};
 
 		o = s.taboption('basic', form.Flag, 'custom_allip', _('Scan all IPs in each /24'),
-			_('Only applies to custom IP lists. Disabled by default, which means CloudflareSpeedTest will randomly test one IP from each /24. Enable this to pass -allip and scan every IP in each /24'));
+			_('Only applies to custom IP lists. Disabled by default: one random IP per /24 is tested. Enable to test every IP in each /24 (slower).'));
 		o.depends('ip_source', 'custom_file');
 		o.default = o.disabled;
 		o.rmempty = false;
 
-		o = s.taboption('basic', form.Value, 'speed_limit', _('Speed threshold (MB/s)'),
-			_('Only IPs with a download speed greater than this threshold will be retained. Please note, do not set this value too high — if no IP meets the requirement, CloudflareSpeedTest may waste excessive time and resources'));
+		o = s.taboption('basic', form.Value, 'tl', _('Latency cap (ms)'),
+			_('Discard candidate IPs whose average latency is above this threshold (measured via the node\'s local SOCKS).'));
 		o.datatype = 'uinteger';
+		o.default = '200';
 		o.rmempty = false;
 
-		o = s.taboption('basic', form.Value, 'custom_url', _('Custom URL'),
-			_('<a href="https://github.com/XIU2/CloudflareSpeedTest/issues/168" target="_blank">How to create</a>'));
+		o = s.taboption('basic', form.Value, 'tll', _('Latency lower bound (ms)'),
+			_('Discard candidate IPs whose average latency is below this threshold.'));
+		o.datatype = 'uinteger';
+		o.default = '40';
 		o.rmempty = false;
-		o.default = 'https://download.parallels.com/desktop/v15/15.1.5-47309/ParallelsDesktop-15.1.5-47309.dmg';
-		o.value('https://speed.cloudflare.com/__down?bytes=99000000', 'speed.cloudflare.com (99M Max)');
-		o.value('https://download.parallels.com/desktop/v15/15.1.5-47309/ParallelsDesktop-15.1.5-47309.dmg', 'Parallels Desktop v15');
-		o.value('https://download.parallels.com/desktop/v17/17.1.1-51537/ParallelsDesktop-17.1.1-51537.dmg', 'Parallels Desktop v17');
-		o.value('https://w.7rs.net/speedtest/200mb.test', 'w.7rs.net (200M)');
-		o.value('https://t1.geigei.gq', 't1.geigei.gq');
-		o.value('https://t2.geigei.gq', 't2.geigei.gq');
 
-		o = s.taboption('basic', form.ListValue, 'proxy_mode', _('Proxy mode'),
-			_('Switch to the selected proxy mode during the speed test'));
-		o.value('nil', _('HOLD'));
-		o.value('gfw', _('GFW List'));
-		o.value('close', _('CLOSE'));
-		o.default = 'gfw';
-		o.depends('node_test', '0');
-
-		// ── 走节点测速模式 ──
-		o = s.taboption('basic', form.Flag, 'node_test', _('Node-based speed test'),
-			_('When enabled, replaces the direct CloudflareSpeedTest path: writes each candidate Cloudflare IP into a passwall node\'s <em>address</em>, spins up a local SOCKS via passwall, and probes latency with <code>curl -I</code> (<code>time_pretransfer</code> → ms). Only latency is measured (no download bandwidth). <strong>Multi-threaded:</strong> if passwall nodes are selected in the Third-Party tab, those nodes run as parallel workers — each tests all candidate IPs through its own chain and gets its own best IP written back; otherwise the single node below is tested serially. Worker addresses are briefly rewritten during the test, so expect short hiccups on those nodes — use dedicated or idle nodes.'));
-		o.default = o.disabled;
+		o = s.taboption('basic', form.Value, 'tlr', _('Packet loss rate cap'),
+			_('Discard candidate IPs whose packet loss ratio exceeds this value (0–1).'));
+		o.datatype = 'ufloat';
+		o.default = '0.2';
 		o.rmempty = false;
 
 		o = s.taboption('basic', form.ListValue, 'node_test_node', _('Passwall node to test through (single-node fallback)'),
 			_('Used only when no passwall workers are selected in the Third-Party tab. Select a CF-CDN-fronted passwall node (VLESS/VMess/Trojan/SS…). Its <em>address</em> will be cycled through candidate IPs and finally set to the fastest one. SOCKS-type nodes are not supported.'));
-		o.depends('node_test', '1');
 		o.value('', _('-- Please choose --'));
 		passwallNodes.forEach(function(n) { o.value(n.value, n.label); });
 		o.rmempty = true;
 
 		o = s.taboption('basic', form.Value, 'node_test_url', _('Probe URL'),
 			_('URL probed via the node\'s local SOCKS; only the HTTP HEAD latency is measured. generate_204 / connectivity-check endpoints are preferred.'));
-		o.depends('node_test', '1');
 		o.default = 'https://www.google.com/generate_204';
 		o.value('https://www.google.com/generate_204', 'Google');
 		o.value('https://www.gstatic.com/generate_204', 'Gstatic');
@@ -396,45 +328,28 @@ return view.extend({
 		o.rmempty = false;
 
 		o = s.taboption('basic', form.Value, 'node_test_count', _('Max IPs to test'),
-			_('This mode tests IPs serially through the node (~3-7s each). Cap the count to avoid long runs; use a smaller IP list or lower this value for faster results.'));
-		o.depends('node_test', '1');
+			_('This mode tests IPs through the node (~3-7s each). Cap the count to avoid long runs; use a smaller IP list or lower this value for faster results.'));
 		o.datatype = 'uinteger';
 		o.default = '30';
 		o.rmempty = false;
 
 		o = s.taboption('basic', form.Value, 'node_test_timeout', _('Probe timeout (s)'),
 			_('Per-IP curl <code>--max-time</code> in seconds.'));
-		o.depends('node_test', '1');
 		o.datatype = 'uinteger';
 		o.default = '5';
 		o.rmempty = false;
 
 		o = s.taboption('basic', form.Value, 'node_test_probes', _('Probes per IP'),
-			_('How many curl probes per candidate IP in node mode (independent of the cdnspeedtest latency count <code>t</code>). Each probe is a full SOCKS+curl, so higher values are slower. If <strong>any</strong> single probe times out, that IP is discarded immediately and the remaining probes are skipped — only IPs that succeed on <em>all</em> probes are kept, so the best IP is a stable one.'));
-		o.depends('node_test', '1');
+			_('How many curl probes per candidate IP. Each probe is a full SOCKS+curl, so higher values are slower. If <strong>any</strong> single probe fails, that IP is discarded immediately and the remaining probes are skipped — only IPs that succeed on <em>all</em> probes are kept, so the best IP is a stable one.'));
 		o.datatype = 'uinteger';
 		o.default = '3';
 		o.rmempty = false;
 
 		o = s.taboption('basic', form.Value, 'node_test_threads', _('Max parallel workers'),
 			_('Cap on concurrently running passwall workers (only relevant when passwall nodes are selected in the Third-Party tab). 0 means run all workers at once. Each worker runs its own SOCKS+curl chain, so high values need more RAM/CPU — keep ≤ node count and mind router limits.'));
-		o.depends('node_test', '1');
 		o.datatype = 'uinteger';
 		o.default = '5';
 		o.rmempty = false;
-
-		o = s.taboption('basic', form.ListValue, 'github_proxy', _('GitHub Mirror'),
-			_('Only used when downloading the CloudflareSpeedTest core from GitHub releases'));
-		o.value('direct', _('Direct'));
-		o.value('ghfast', 'ghfast.top');
-		o.value('ghproxy', 'ghproxy.cc');
-		o.value('custom', _('Custom'));
-		o.default = 'direct';
-
-		o = s.taboption('basic', form.Value, 'github_proxy_custom', _('Custom GitHub Mirror'),
-			_('Enter a GitHub mirror prefix, for example: https://ghfast.top/'));
-		o.depends('github_proxy', 'custom');
-		o.rmempty = true;
 
 		s.tab('cron', _('Crontab Settings'));
 
@@ -457,79 +372,6 @@ return view.extend({
 		});
 		o.default = '24';
 
-		s.tab('advanced', _('Advanced'));
-
-		o = s.taboption('advanced', form.Flag, 'advanced', _('Advanced'), _('Not recommended'));
-		o.default = o.disabled;
-		o.rmempty = false;
-
-		o = s.taboption('advanced', form.Value, 'threads', _('Thread Count'));
-		o.datatype = 'uinteger';
-		o.default = '200';
-		o.rmempty = true;
-		o.depends('advanced', '1');
-
-		o = s.taboption('advanced', form.Value, 'tl', _('Average latency cap'));
-		o.datatype = 'uinteger';
-		o.default = '200';
-		o.rmempty = true;
-		o.depends('advanced', '1');
-
-		o = s.taboption('advanced', form.Value, 'tll', _('Average latency lower bound'));
-		o.datatype = 'uinteger';
-		o.default = '40';
-		o.rmempty = true;
-		o.depends('advanced', '1');
-
-		o = s.taboption('advanced', form.Value, 'tlr', _('Packet loss rate cap'));
-		o.datatype = 'ufloat';
-		o.default = '0.2';
-		o.rmempty = true;
-		o.depends('advanced', '1');
-
-		o = s.taboption('advanced', form.Value, 't', _('Delayed speed measurement time'));
-		o.datatype = 'uinteger';
-		o.default = '4';
-		o.rmempty = true;
-		o.depends('advanced', '1');
-
-		o = s.taboption('advanced', form.Value, 'dt', _('Download speed test time'));
-		o.datatype = 'uinteger';
-		o.default = '10';
-		o.rmempty = true;
-		o.depends('advanced', '1');
-		o.depends('node_test', '0');
-
-		o = s.taboption('advanced', form.Value, 'dn', _('Number of download speed tests'));
-		o.datatype = 'uinteger';
-		o.default = '5';
-		o.rmempty = true;
-		o.depends('advanced', '1');
-		o.depends('node_test', '0');
-
-		o = s.taboption('advanced', form.Flag, 'dd', _('Disable download speed test'));
-		o.default = o.disabled;
-		o.rmempty = true;
-		o.depends('advanced', '1');
-		o.depends('node_test', '0');
-
-		o = s.taboption('advanced', form.Value, 'tp', _('Port'));
-		o.datatype = 'port';
-		o.default = '443';
-		o.rmempty = true;
-		o.depends('advanced', '1');
-
-		o = s.taboption('advanced', form.Flag, 'httping', _('Use HTTP for latency test'));
-		o.default = o.disabled;
-		o.rmempty = true;
-		o.depends('advanced', '1');
-
-		o = s.taboption('advanced', form.Value, 'cfcolo', _('Cloudflare colo code'));
-		o.datatype = 'string';
-		o.default = '';
-		o.rmempty = true;
-		o.depends('httping', '1');
-
 		s = m.section(form.NamedSection, 'global', 'global', _('Best IP'));
 		s.addremove = false;
 		o = s.option(form.TextValue, '_best_result');
@@ -542,19 +384,14 @@ return view.extend({
 		o.write = function() {};
 
 		return m.render().then(L.bind(function(formNode) {
-			const statusNode = E('p', { id: 'cloudflarespeedtest-status' }, _('Collecting data...'));
+			const statusNode = E('p', { id: 'passwall-speedtest-status' }, _('Collecting data...'));
 			this.updateStatus(statusNode, status);
 
 			const chartNode = E('div', { 'class': 'cbi-section' }, [
 				E('h3', {}, _('History Charts')),
 				chartCss(),
-				E('div', { 'class': 'cloudflarespeedtest-chart-row' }, [
-					E('div', { 'class': 'cloudflarespeedtest-chart-container' }, [
-						E('canvas', { id: 'cloudflarespeedtest-latency-chart' })
-					]),
-					E('div', { 'class': 'cloudflarespeedtest-chart-container' }, [
-						E('canvas', { id: 'cloudflarespeedtest-speed-chart' })
-					])
+				E('div', { 'class': 'passwall-speedtest-chart-container' }, [
+					E('canvas', { id: 'passwall-speedtest-latency-chart' })
 				])
 			]);
 
@@ -572,8 +409,8 @@ return view.extend({
 
 			poll.add(L.bind(this.pollStatus, this, statusNode, actionButton), 3);
 
-			script(L.resource('cloudflarespeedtest/chart.js')).then(function() {
-				return script(L.resource('cloudflarespeedtest/chartjs-adapter-date-fns.js'));
+			script(L.resource('passwall-speedtest/chart.js')).then(function() {
+				return script(L.resource('passwall-speedtest/chartjs-adapter-date-fns.js'));
 			}).then(L.bind(function() {
 				this.drawCharts(chartNode, history);
 			}, this));

@@ -1,21 +1,23 @@
 #!/bin/sh
 
-LOG_FILE='/tmp/cloudflarespeedtest.log'
-RESULT_DIR='/tmp/CloudflareSpeedTest'
+LOG_FILE='/tmp/passwall-speedtest.log'
+RESULT_DIR='/tmp/passwall-speedtest'
 IP_FILE="$RESULT_DIR/result.csv"
-IPV4_TXT='/usr/share/CloudflareSpeedTest/ip.txt'
-IPV6_TXT='/usr/share/CloudflareSpeedTest/ipv6.txt'
+IPV4_TXT='/usr/share/passwall-speedtest/ip.txt'
+IPV6_TXT='/usr/share/passwall-speedtest/ipv6.txt'
+
+SCRIPT_DIR='/usr/bin/passwall-speedtest'
 
 function get_global_config(){
     while [[ "$*" != "" ]]; do
-        eval ${1}='`uci get cloudflarespeedtest.global.$1`' 2>/dev/null
+        eval ${1}='`uci get passwall-speedtest.global.$1`' 2>/dev/null
         shift
     done
 }
 
 function get_servers_config(){
     while [[ "$*" != "" ]]; do
-        eval ${1}='`uci get cloudflarespeedtest.servers.$1`' 2>/dev/null
+        eval ${1}='`uci get passwall-speedtest.servers.$1`' 2>/dev/null
         shift
     done
 }
@@ -27,173 +29,8 @@ echolog() {
 }
 
 function read_config(){
-    get_global_config "enabled" "speed_limit" "custom_url" "threads" "custom_cron_enabled" "custom_cron" "t" "tp" "dt" "dn" "dd" "tl" "tll" "tlr" "ipv6_enabled" "ip_source" "custom_ip_file" "custom_allip" "advanced" "proxy_mode" "github_proxy" "github_proxy_custom" "httping" "cfcolo" "node_test" "node_test_node" "node_test_url" "node_test_count" "node_test_timeout" "node_test_probes" "node_test_threads"
+    get_global_config "enabled" "custom_cron_enabled" "custom_cron" "tl" "tll" "tlr" "ip_source" "custom_ip_file" "custom_allip" "node_test_node" "node_test_url" "node_test_count" "node_test_timeout" "node_test_probes" "node_test_threads"
     get_servers_config "ssr_services" "ssr_enabled" "passwall_enabled" "passwall_services" "passwall2_enabled" "passwall2_services" "bypass_enabled" "bypass_services" "vssr_enabled" "vssr_services" "DNS_enabled" "AliDNS_ip_count" "HOST_enabled" "MosDNS_enabled" "MosDNS_ip_count" "openclash_restart" "AstraDNS_enabled" "AstraDNS_config" "AstraDNS_bin"
-}
-
-function appinit(){
-    ssr_started='';
-    passwall_started='';
-    passwall2_started='';
-    bypass_started='';
-    vssr_started='';
-    homeproxy_started='';
-}
-
-function homeproxy_client_active() {
-    local routing_mode outbound_node
-
-    routing_mode="$(uci get homeproxy.config.routing_mode 2>/dev/null)"
-    if [ "x${routing_mode}" = "xcustom" ] ;then
-        outbound_node="$(uci get homeproxy.routing.default_outbound 2>/dev/null)"
-    else
-        outbound_node="$(uci get homeproxy.config.main_node 2>/dev/null)"
-    fi
-
-    [ "x${outbound_node}" != "x" ] && [ "x${outbound_node}" != "xnil" ]
-}
-
-function prepare_homeproxy() {
-    [ -f /etc/config/homeproxy ] || return 0
-    homeproxy_client_active || return 0
-
-    homeproxy_original_routing_mode="$(uci get homeproxy.config.routing_mode 2>/dev/null)"
-    homeproxy_original_main_node="$(uci get homeproxy.config.main_node 2>/dev/null)"
-    homeproxy_original_main_udp_node="$(uci get homeproxy.config.main_udp_node 2>/dev/null)"
-    homeproxy_original_default_outbound="$(uci get homeproxy.routing.default_outbound 2>/dev/null)"
-
-    if [ $proxy_mode == "close" ] ;then
-        if [ "x${homeproxy_original_routing_mode}" = "xcustom" ] ;then
-            uci set homeproxy.routing.default_outbound="nil"
-        else
-            uci set homeproxy.config.main_node="nil"
-            uci set homeproxy.config.main_udp_node="nil"
-        fi
-    elif [ $proxy_mode == "gfw" ] ;then
-        if [ "x${homeproxy_original_routing_mode}" = "xcustom" ] ;then
-            echolog "HomeProxy 当前为自定义路由，测速期间临时停用客户端代理"
-            uci set homeproxy.routing.default_outbound="nil"
-        else
-            uci set homeproxy.config.routing_mode="gfwlist"
-        fi
-    else
-        return 0
-    fi
-
-    homeproxy_started='1'
-    uci commit homeproxy
-    /etc/init.d/homeproxy restart 2>/dev/null
-}
-
-function restore_homeproxy() {
-    if [ "x${homeproxy_started}" != "x1" ] ;then
-        return 0
-    fi
-
-    [ -n "$homeproxy_original_routing_mode" ] && uci set homeproxy.config.routing_mode="${homeproxy_original_routing_mode}"
-    [ -n "$homeproxy_original_main_node" ] && uci set homeproxy.config.main_node="${homeproxy_original_main_node}"
-    [ -n "$homeproxy_original_main_udp_node" ] && uci set homeproxy.config.main_udp_node="${homeproxy_original_main_udp_node}"
-    [ -n "$homeproxy_original_default_outbound" ] && uci set homeproxy.routing.default_outbound="${homeproxy_original_default_outbound}"
-
-    uci commit homeproxy
-    /etc/init.d/homeproxy restart 2>/dev/null
-    echolog "HomeProxy 重启完成"
-}
-
-check_wgetcurl(){
-    echo "Checking for wget or curl..."
-    which wget && downloader="wget --no-check-certificate -T 20 -O" && return
-    which curl && downloader="curl -L -k --retry 2 --connect-timeout 20 -o" && return
-    [ -z "$1" ] && opkg update || (echo "Failed to run opkg update" && exit 1)
-    [ -z "$1" ] && (opkg remove wget wget-nossl --force-depends ; opkg install wget ; check_wgetcurl 1 ;return)
-    [ "$1" == "1" ] && (opkg install curl ; check_wgetcurl 2 ; return)
-    echo "Error: curl and wget not found" && exit 1
-}
-
-function get_github_mirror_prefix() {
-    case "$github_proxy" in
-        ghfast)
-            echo "https://ghfast.top/"
-            ;;
-        ghproxy)
-            echo "https://ghproxy.cc/"
-            ;;
-        custom)
-            if [ -n "$github_proxy_custom" ] ;then
-                case "$github_proxy_custom" in
-                    */) echo "$github_proxy_custom" ;;
-                    *) echo "${github_proxy_custom}/" ;;
-                esac
-            fi
-            ;;
-        *)
-            echo ""
-            ;;
-    esac
-}
-
-function download_core() {
-    um="$(uname -m)"
-    OPENWRT_ARCH="$(awk -F'=' '/^OPENWRT_ARCH=/{gsub(/"/,"",$2); split($2,a,"_"); print a[1]}' /etc/os-release)"
-    case "$um" in
-        i386|i686)     Arch="386" ;;
-        x86_64)        Arch="amd64" ;;
-        aarch64)       Arch="arm64" ;;
-        armv5*)        Arch="armv5" ;;
-        armv6*)        Arch="armv6" ;;
-        armv7*|armv8l) Arch="armv7" ;;
-        mips*)
-            case "$OPENWRT_ARCH" in
-                mips64el) Arch="mips64le" ;;   # 64‑bit little‑endian
-                mips64)   Arch="mips64"   ;;   # 64‑bit big‑endian
-                mipsel)   Arch="mipsle"   ;;   # 32‑bit little‑endian
-                mips)     Arch="mips"     ;;   # 32‑bit big‑endian
-                *) echo "Error: unknown OpenWrt MIPS flavour '$OPENWRT_ARCH'"; exit 1 ;;
-            esac
-            ;;
-        *) echo "Error: $um is not supported"; exit 1 ;;
-    esac
-
-    echo "Start download..."
-    raw_link="https://github.com/XIU2/CloudflareSpeedTest/releases/download/v2.3.4/cfst_linux_$Arch.tar.gz"
-    github_mirror_prefix="$(get_github_mirror_prefix)"
-    if [ -n "$github_mirror_prefix" ] ;then
-        link="${github_mirror_prefix}${raw_link}"
-    else
-        link="${raw_link}"
-    fi
-
-    echolog "Core download URL: $link"
-    check_wgetcurl
-
-    $downloader /tmp/${link##*/} "$link" 2>&1
-    if [ "$?" != "0" ]; then
-        echo "Download failed"
-        exit 1
-    fi
-
-    # Decompress .tar.gz to .tar, run ucode patch on the .tar, then extract the .tar
-    gzfile="/tmp/${link##*/}"
-    tarfile="${gzfile%.gz}"
-
-    # If we have a .gz file, decompress it to produce a .tar
-    if [ "${gzfile##*.}" = "gz" ] && [ -f "$gzfile" ]; then
-        gzip -d "$gzfile" || (echo "Failed to decompress $gzfile" && exit 1)
-    fi
-
-    # If original was gz (now we have a .tar), run patch.uc on the tar then extract it
-    if [ "${gzfile##*.}" = "gz" ]; then
-        ucode /usr/bin/cloudflarespeedtest/patch.uc "$tarfile"
-        tar -xf "$tarfile" -C "/tmp/"
-        if [ ! -e "/tmp/cfst" ]; then
-            echo "Failed to extract core from archive."
-            exit 1
-        fi
-        downloadbin="/tmp/cfst"
-    fi
-
-    echo "Download success. Start copy."
-    mv -f "$downloadbin" /usr/bin/cdnspeedtest
 }
 
 function rotate_result_files(){
@@ -218,7 +55,7 @@ function first_result_ip(){
     sed -n '2,$p' "$1" 2>/dev/null | grep -v '^#' | awk -F, 'NF >= 7 && $1 != "" { print $1; exit }'
 }
 
-# 按「下载速度(第6列)降序、平均延迟(第5列)升序」排序结果数据行，表头保留在首行。
+# 按延迟升序排序结果数据行，表头保留在首行。
 # 兼容测速被中断、二进制未完成最终排序的情况，保证最快 IP 位于首行。
 # 第二参数 mode=latency 时（走节点测速模式，下载列恒 0.00）仅按延迟升序排。
 # 用 awk 自实现排序，不依赖 sort 的 -k/-n 浮点修饰符（某些 busybox sort 会忽略 -k 键
@@ -269,11 +106,7 @@ function select_ip_file(){
             fi
             ;;
         "")
-            if [ "${ipv6_enabled:-0}" = "1" ]; then
-                echo "$IPV6_TXT"
-            else
-                echo "$IPV4_TXT"
-            fi
+            echo "$IPV4_TXT"
             ;;
         *)
             echolog "Unknown IP list source: ${ip_source}, fallback to built-in IPv4 list" >/dev/null
@@ -283,166 +116,14 @@ function select_ip_file(){
 }
 
 function speed_test(){
-
-    # 走节点测速模式：用待测 IP 替换 passwall 节点 address，经该节点本地 SOCKS 探测延迟。
-    # 取代 cdnspeedtest 直连路径，跳过 proxy_mode 改写（走节点时不需要切代理模式）。
-    if [ "${node_test:-0}" = "1" ]; then
-        node_speed_test
-        return $?
-    fi
-
-    rm -rf $LOG_FILE
-    mkdir -p "$RESULT_DIR"
-    result_tmp="$(mktemp "${RESULT_DIR}/result.csv.tmp.XXXXXX")" || {
-        echolog "创建临时测速结果文件失败"
-        return 1
-    }
-
-    if [ ! -e /usr/bin/cdnspeedtest ]; then
-        download_core >>$LOG_FILE
-    fi
-
-    command="/usr/bin/cdnspeedtest -sl ${speed_limit} -url ${custom_url} -o ${result_tmp}"
-
-    selected_ip_file="$(select_ip_file)"
-    command="${command} -f ${selected_ip_file}"
-
-    if [ "${ip_source:-}" = "custom_file" ] && [ "${custom_allip:-0}" = "1" ] ; then
-        command="${command} -allip"
-    fi
-
-    if [ $advanced -eq "1" ] ; then
-        command="${command} -tl ${tl} -tll ${tll} -tlr ${tlr:-0.2} -n ${threads} -t ${t} -dt ${dt} -dn ${dn}"
-        if [ $dd -eq "1" ] ; then
-            command="${command} -dd"
-        fi
-        if [ $tp -ne "443" ] ; then
-            command="${command} -tp ${tp}"
-        fi
-        if [ "${httping:-0}" -eq "1" ] ; then
-            command="${command} -httping"
-            if [ -n "${cfcolo:-}" ] ; then
-                command="${command} -cfcolo ${cfcolo}"
-            fi
-        fi
-    else
-        # Default param: -tl 200 -tll 40 -tlr 0.2 -n 200 -t 4 -dt 10
-        command="${command} -tl ${tl} -tll ${tll} -tlr ${tlr:-0.2} -dn 5"
-    fi
-
-    appinit
-
-    ssr_original_server=$(uci get shadowsocksr.@global[0].global_server 2>/dev/null)
-    ssr_original_run_mode=$(uci get shadowsocksr.@global[0].run_mode 2>/dev/null)
-    if [ "x${ssr_original_server}" != "xnil" ] && [ "x${ssr_original_server}"  !=  "x" ] ;then
-        if [ $proxy_mode  == "close" ] ;then
-            uci set shadowsocksr.@global[0].global_server="nil"
-            elif  [ $proxy_mode  == "gfw" ] ;then
-            uci set shadowsocksr.@global[0].run_mode="gfw"
-        fi
-        ssr_started='1';
-        uci commit shadowsocksr
-        /etc/init.d/shadowsocksr restart
-    fi
-
-    passwall_server_enabled=$(uci get passwall.@global[0].enabled 2>/dev/null)
-    passwall_original_run_mode=$(uci get passwall.@global[0].tcp_proxy_mode 2>/dev/null)
-    if [ "x${passwall_server_enabled}" == "x1" ] ;then
-        if [ $proxy_mode  == "close" ] ;then
-            uci set passwall.@global[0].enabled="0"
-            elif  [ $proxy_mode  == "gfw" ] ;then
-            uci set passwall.@global[0].tcp_proxy_mode="gfwlist"
-        fi
-        passwall_started='1';
-        uci commit passwall
-        /etc/init.d/passwall  restart 2>/dev/null
-    fi
-
-    passwall2_server_enabled=$(uci get passwall2.@global[0].enabled 2>/dev/null)
-    passwall2_original_run_mode=$(uci get passwall2.@global[0].tcp_proxy_mode 2>/dev/null)
-    if [ "x${passwall2_server_enabled}" == "x1" ] ;then
-        if [ $proxy_mode  == "close" ] ;then
-            uci set passwall2.@global[0].enabled="0"
-            elif  [ $proxy_mode  == "gfw" ] ;then
-            uci set passwall2.@global[0].tcp_proxy_mode="gfwlist"
-        fi
-        passwall2_started='1';
-        uci commit passwall2
-        /etc/init.d/passwall2 restart 2>/dev/null
-    fi
-
-    vssr_original_server=$(uci get vssr.@global[0].global_server 2>/dev/null)
-    vssr_original_run_mode=$(uci get vssr.@global[0].run_mode 2>/dev/null)
-    if [ "x${vssr_original_server}" != "xnil" ] && [ "x${vssr_original_server}"  !=  "x" ] ;then
-
-        if [ $proxy_mode  == "close" ] ;then
-            uci set vssr.@global[0].global_server="nil"
-            elif  [ $proxy_mode  == "gfw" ] ;then
-            uci set vssr.@global[0].run_mode="gfw"
-        fi
-        vssr_started='1';
-        uci commit vssr
-        /etc/init.d/vssr restart
-    fi
-
-    bypass_original_server=$(uci get bypass.@global[0].global_server 2>/dev/null)
-    bypass_original_run_mode=$(uci get bypass.@global[0].run_mode 2>/dev/null)
-    if [ "x${bypass_original_server}" != "x" ] ;then
-        if [ $proxy_mode  == "close" ] ;then
-            uci set bypass.@global[0].global_server=""
-            elif  [ $proxy_mode  == "gfw" ] ;then
-            uci set bypass.@global[0].run_mode="gfw"
-        fi
-        bypass_started='1';
-        uci commit bypass
-        /etc/init.d/bypass restart
-    fi
-
-    if [ "x${MosDNS_enabled}" == "x1" ] ;then
-        if [ -n "$(grep 'option cloudflare' /etc/config/mosdns)" ]
-        then
-            sed -i".bak" "/option cloudflare/d" /etc/config/mosdns
-        fi
-        sed -i '/^$/d' /etc/config/mosdns && echo -e "\toption cloudflare '0'" >> /etc/config/mosdns
-
-        /etc/init.d/mosdns restart &>/dev/null
-        if [ "x${openclash_restart}" == "x1" ] ;then
-            /etc/init.d/openclash restart &>/dev/null
-        fi
-    fi
-
-    prepare_homeproxy
-
-    echo $command >> $LOG_FILE 2>&1
-    echolog "-----------start----------"
-    rc_file='/tmp/cf_speedtest_rc'
-    rm -f "$rc_file"
-    ( $command 2>&1; echo $? > "$rc_file" ) | tr '\r' '\n' | awk -f /usr/bin/cloudflarespeedtest/progress.awk >> $LOG_FILE
-    command_rc="$(cat "$rc_file" 2>/dev/null)"
-    [ -n "$command_rc" ] || command_rc=0
-    rm -f "$rc_file"
-    echolog "-----------end------------"
-
-    if [ $command_rc -ne 0 ]; then
-        echolog "CloudflareST 测速被中断或异常退出（返回码 $command_rc），尝试保存已获取的结果"
-    fi
-
-    if [ -z "$(first_result_ip "$result_tmp")" ]; then
-        echolog "CloudflareST 测速结果 IP 数量为 0，保留上一次结果"
-        rm -f "$result_tmp"
-        return 1
-    fi
-
-    # 对结果按下载速度降序排序（兼容被中断时未完成排序的情况），保证最快 IP 位于首行。
-    sort_result "$result_tmp"
-
-    # Append current time to the validated result, then rotate old results.
-    echo "# Speed test time: $(date +'%Y-%m-%d %H:%M:%S')" >> "$result_tmp"
-    rotate_result_files
-    mv -f "$result_tmp" "$IP_FILE"
+    # 走节点测速：把候选 CF IP 写进 passwall 节点 address，用 passwall app.sh run_socks
+    # 拉本地 SOCKS，curl -I 取 time_pretransfer 测延迟，多 worker 并行、多 probe fail-fast。
+    # 结果写回各 passwall worker 节点。
+    node_speed_test
+    return $?
 }
 
-# ── 走节点测速模式 ──────────────────────────────────────────────
+# ── 走节点测速 ──────────────────────────────────────────────
 # 把每个候选 CF IP 临时写进一个 passwall 节点的 address，再用 passwall 式
 # URL 测速（拉起该节点本地 SOCKS → curl -I 探测 → 取 time_pretransfer 得毫秒）
 # 按延迟选最优 IP，测完把最优 IP 留在该节点 address。只测延迟，不测下载带宽。
@@ -467,7 +148,7 @@ node_test_cleanup() {
         for pid_file in /tmp/etc/passwall/*"${NODE_TEST_FLAG_BASE}"*_plugin.pid; do
             [ -s "$pid_file" ] && kill -9 "$(head -n1 "$pid_file")" >/dev/null 2>&1
         done
-        busybox pgrep -af "${NODE_TEST_FLAG_BASE}" 2>/dev/null | awk '! /cloudflarespeedtest\.sh/{print $1}' | xargs kill -9 >/dev/null 2>&1
+        busybox pgrep -af "${NODE_TEST_FLAG_BASE}" 2>/dev/null | awk '! /passwall-speedtest\.sh/{print $1}' | xargs kill -9 >/dev/null 2>&1
         rm -rf /tmp/etc/passwall/*"${NODE_TEST_FLAG_BASE}"* 2>/dev/null
     fi
     rmdir "${NT_LOCKDIR}" 2>/dev/null
@@ -549,7 +230,7 @@ node_test_worker() {
         for _pf in /tmp/etc/passwall/*"${_flag}"*_plugin.pid; do
             [ -s "$_pf" ] && kill -9 "$(head -n1 "$_pf")" >/dev/null 2>&1
         done
-        busybox pgrep -af "${_flag}" 2>/dev/null | awk '! /cloudflarespeedtest\.sh/{print $1}' | xargs kill -9 >/dev/null 2>&1
+        busybox pgrep -af "${_flag}" 2>/dev/null | awk '! /passwall-speedtest\.sh/{print $1}' | xargs kill -9 >/dev/null 2>&1
         rm -rf /tmp/etc/passwall/*"${_flag}"* 2>/dev/null
         # 均值/丢包
         local _avg=0 _loss="1.00"
@@ -586,12 +267,12 @@ node_test_worker() {
 
 node_speed_test() {
     # 校验 passwall 已安装
-    [ -f /usr/share/passwall/app.sh ] || { echolog "未安装 passwall，无法使用走节点测速模式"; return 1; }
-    [ -f /usr/share/passwall/utils.sh ] || { echolog "缺少 passwall utils.sh，无法使用走节点测速模式"; return 1; }
+    [ -f /usr/share/passwall/app.sh ] || { echolog "未安装 passwall，无法使用走节点测速"; return 1; }
+    [ -f /usr/share/passwall/utils.sh ] || { echolog "缺少 passwall utils.sh，无法使用走节点测速"; return 1; }
     # passwall 的 utils.sh 会覆盖 LOG_FILE 与 echolog()，先保存再恢复，避免日志写进 passwall 的日志文件
-    local _cfst_log_file="$LOG_FILE"
+    local _pws_log_file="$LOG_FILE"
     . /usr/share/passwall/utils.sh
-    LOG_FILE="$_cfst_log_file"
+    LOG_FILE="$_pws_log_file"
     echolog() {
         local d="$(date "+%Y-%m-%d %H:%M:%S")"
         echo -e "$d: $*"
@@ -766,24 +447,18 @@ function ip_replace(){
     # 获取最快 IP（从 result.csv 结果文件中获取第一个 IP）
     bestip=$(first_result_ip "$IP_FILE")
     if [[ -z "${bestip}" ]]; then
-        echolog "CloudflareST 测速结果 IP 数量为 0,跳过下面步骤..."
+        echolog "走节点测速结果 IP 数量为 0,跳过下面步骤..."
     else
         host_ip
         mosdns_ip
         astra_dns_ip
         alidns_ip
-        # 走节点测速模式下,bestip 只对 node_test_node 最优,不写其它代理节点(它们是别的节点,该 IP 没替它们测过)
-        if [ "${node_test:-0}" != "1" ]; then
-            ssr_best_ip
-            vssr_best_ip
-            bypass_best_ip
-            passwall_best_ip
-            passwall2_best_ip
-        fi
-
+        ssr_best_ip
+        vssr_best_ip
+        bypass_best_ip
+        passwall_best_ip
+        passwall2_best_ip
     fi
-
-    restart_app
 }
 
 function host_ip() {
@@ -852,12 +527,12 @@ function astra_dns_ip() {
         astra_config="${AstraDNS_config:-/etc/astra-dns/named.yaml}"
         astra_bin="${AstraDNS_bin:-/usr/bin/astra-dns}"
 
-        if [ ! -x /usr/bin/cloudflarespeedtest/astra-dns.sh ]; then
-            echolog "astra-dns 写入失败: /usr/bin/cloudflarespeedtest/astra-dns.sh 不存在"
+        if [ ! -x ${SCRIPT_DIR}/astra-dns.sh ]; then
+            echolog "astra-dns 写入失败: ${SCRIPT_DIR}/astra-dns.sh 不存在"
             return 1
         fi
 
-        if /usr/bin/cloudflarespeedtest/astra-dns.sh --result-csv "$IP_FILE" --config "$astra_config" --bin "$astra_bin" >>$LOG_FILE 2>&1; then
+        if ${SCRIPT_DIR}/astra-dns.sh --result-csv "$IP_FILE" --config "$astra_config" --bin "$astra_bin" >>$LOG_FILE 2>&1; then
             echolog "astra-dns 写入完成，配置文件: $astra_config"
         else
             echolog "astra-dns 写入失败，请检查配置文件路径、二进制路径和 YAML 格式"
@@ -927,65 +602,6 @@ function bypass_best_ip(){
     fi
 }
 
-function restart_app(){
-    if [ "x${ssr_started}" == "x1" ] ;then
-        if [ $proxy_mode  == "close" ] ;then
-            uci set shadowsocksr.@global[0].global_server="${ssr_original_server}"
-            elif [ $proxy_mode  == "gfw" ] ;then
-            uci set  shadowsocksr.@global[0].run_mode="${ssr_original_run_mode}"
-        fi
-        uci commit shadowsocksr
-        /etc/init.d/shadowsocksr restart &>/dev/null
-        echolog "ssr重启完成"
-    fi
-
-    if [ "x${passwall_started}" == "x1" ] ;then
-        if [ $proxy_mode  == "close" ] ;then
-            uci set passwall.@global[0].enabled="${passwall_server_enabled}"
-            elif [ $proxy_mode  == "gfw" ] ;then
-            uci set passwall.@global[0].tcp_proxy_mode="${passwall_original_run_mode}"
-        fi
-        uci commit passwall
-        /etc/init.d/passwall restart 2>/dev/null
-        echolog "passwall重启完成"
-    fi
-
-    if [ "x${passwall2_started}" == "x1" ] ;then
-        if [ $proxy_mode  == "close" ] ;then
-            uci set passwall2.@global[0].enabled="${passwall2_server_enabled}"
-            elif [ $proxy_mode  == "gfw" ] ;then
-            uci set passwall2.@global[0].tcp_proxy_mode="${passwall2_original_run_mode}"
-        fi
-        uci commit passwall2
-        /etc/init.d/passwall2 restart 2>/dev/null
-        echolog "passwall2重启完成"
-    fi
-
-    if [ "x${vssr_started}" == "x1" ] ;then
-        if [ $proxy_mode  == "close" ] ;then
-            uci set vssr.@global[0].global_server="${vssr_original_server}"
-            elif [ $proxy_mode  == "gfw" ] ;then
-            uci set vssr.@global[0].run_mode="${vssr_original_run_mode}"
-        fi
-        uci commit vssr
-        /etc/init.d/vssr restart &>/dev/null
-        echolog "Vssr重启完成"
-    fi
-
-    if [ "x${bypass_started}" == "x1" ] ;then
-        if [ $proxy_mode  == "close" ] ;then
-            uci set bypass.@global[0].global_server="${bypass_original_server}"
-            elif [ $proxy_mode  == "gfw" ] ;then
-            uci set  bypass.@global[0].run_mode="${bypass_original_run_mode}"
-        fi
-        uci commit bypass
-        /etc/init.d/bypass restart &>/dev/null
-        echolog "Bypass重启完成"
-    fi
-
-    restore_homeproxy
-}
-
 function alidns_ip(){
     if [ "x${DNS_enabled}" == "x1" ] ;then
         get_servers_config "DNS_type" "app_key" "app_secret" "main_domain" "sub_domain" "line" "AliDNS_ip_count"
@@ -1010,7 +626,7 @@ function alidns_ip(){
 
             for sub in $sub_domain
             do
-                if /usr/bin/cloudflarespeedtest/aliddns.sh "$app_key" "$app_secret" "$main_domain" "$sub" "$line" "$bestip_is_ipv6" $bestips; then
+                if ${SCRIPT_DIR}/aliddns.sh "$app_key" "$app_secret" "$main_domain" "$sub" "$line" "$bestip_is_ipv6" $bestips; then
                     echolog "更新域名${sub}阿里云DNS完成，已写入IP: $bestips"
                 else
                     echolog "更新域名${sub}阿里云DNS失败，请检查上方阿里云API错误信息"

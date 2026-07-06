@@ -7,7 +7,7 @@ usage() {
 Usage: astra-dns.sh --result-csv FILE --config FILE [options]
 
 Options:
-  --result-csv FILE   CloudflareSpeedTest result CSV file
+  --result-csv FILE   speed test result CSV file
   --config FILE       astra-dns YAML config file
   --bin FILE          astra-dns binary path (default: /usr/bin/astra-dns)
   --backup FILE       Backup path for the original config (default: CONFIG.bak)

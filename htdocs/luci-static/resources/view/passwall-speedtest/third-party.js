@@ -5,7 +5,7 @@
 'require uci';
 
 const callListNodes = rpc.declare({
-	object: 'cloudflarespeedtest',
+	object: 'passwall-speedtest',
 	method: 'list_nodes',
 	expect: {}
 });
@@ -20,7 +20,7 @@ function addNodeValues(option, nodes) {
 return view.extend({
 	load: function() {
 		return Promise.all([
-			uci.load('cloudflarespeedtest'),
+			uci.load('passwall-speedtest'),
 			callListNodes()
 		]);
 	},
@@ -29,7 +29,7 @@ return view.extend({
 		let m, s, o;
 		const nodes = data[1] || {};
 
-		m = new form.Map('cloudflarespeedtest', _('Third Party Application Settings'));
+		m = new form.Map('passwall-speedtest', _('Third Party Application Settings'));
 
 		s = m.section(form.NamedSection, 'servers', 'servers');
 		s.addremove = false;

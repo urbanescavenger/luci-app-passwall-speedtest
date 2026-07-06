@@ -3,9 +3,9 @@
 const fs = require('fs');
 const uci = require('uci');
 
-const LOG_FILE = '/tmp/cloudflarespeedtest.log';
-const RESULT_FILE = '/tmp/CloudflareSpeedTest/result.csv';
-const RUN_SCRIPT = '/usr/bin/cloudflarespeedtest/cloudflarespeedtest.sh';
+const LOG_FILE = '/tmp/passwall-speedtest.log';
+const RESULT_FILE = '/tmp/passwall-speedtest/result.csv';
+const RUN_SCRIPT = '/usr/bin/passwall-speedtest/passwall-speedtest.sh';
 
 function command(cmd) {
 	let rc = system(cmd);
@@ -90,31 +90,18 @@ function read_file_chunk(path, pos) {
 	};
 }
 
-function node_test_enabled() {
-	let cur = uci.cursor();
-
-	try {
-		cur.load('cloudflarespeedtest');
-		return cur.get('cloudflarespeedtest', 'global', 'node_test') == '1';
-	}
-	catch (e) {}
-
-	return false;
-}
-
 function status() {
 	let cur = uci.cursor();
 	let enabled = '0';
 
 	try {
-		cur.load('cloudflarespeedtest');
-		enabled = cur.get('cloudflarespeedtest', 'global', 'enabled') || '0';
+		cur.load('passwall-speedtest');
+		enabled = cur.get('passwall-speedtest', 'global', 'enabled') || '0';
 	}
 	catch (e) {}
 
-	// 走节点测速模式无 cdnspeedtest 进程，改用脚本主进程判定；二者任一存活即视为运行中
-	let running = (command('pgrep cdnspeedtest >/dev/null 2>&1').code == 0)
-		|| (command('pgrep -f "[c]loudflarespeedtest\\.sh" >/dev/null 2>&1').code == 0);
+	// 走节点测速无独立二进制进程，用脚本主进程判定运行中
+	let running = (command('pgrep -f "[p]asswall-speedtest\\.sh" >/dev/null 2>&1').code == 0);
 
 	return {
 		running: running,
@@ -123,25 +110,17 @@ function status() {
 }
 
 function start() {
-	command('pgrep cdnspeedtest | xargs kill -9 >/dev/null 2>&1');
-	command('pgrep -f "[c]loudflarespeedtest\\.sh" | xargs kill -9 >/dev/null 2>&1');
+	command('pgrep -f "[p]asswall-speedtest\\.sh" | xargs kill -9 >/dev/null 2>&1');
 	command(shquote(RUN_SCRIPT) + ' start >/dev/null 2>&1 &');
 
 	return {};
 }
 
 function stop() {
-	if (node_test_enabled()) {
-		// 走节点测速模式：SIGINT 通知脚本主进程，触发其 trap 清理 SOCKS 并恢复节点 address
-		command('pgrep -f "[c]loudflarespeedtest\\.sh" | xargs kill -INT >/dev/null 2>&1');
-		command('( sleep 3; pgrep -f "[c]loudflarespeedtest\\.sh" | xargs kill -9 >/dev/null 2>&1 ) >/dev/null 2>&1 &');
-	}
-	else {
-		// cdnspeedtest 模式：SIGINT 让其把已测速的部分结果写入 -o 临时文件后再退出
-		command('pgrep cdnspeedtest | xargs kill -INT >/dev/null 2>&1');
-		// 留 3 秒 flush，仍未退出则强杀兜底（避免卡死）
-		command('( sleep 3; pgrep cdnspeedtest | xargs kill -9 >/dev/null 2>&1 ) >/dev/null 2>&1 &');
-	}
+	// SIGINT 通知脚本主进程，触发其 trap 清理 SOCKS 并恢复节点 address
+	command('pgrep -f "[p]asswall-speedtest\\.sh" | xargs kill -INT >/dev/null 2>&1');
+	// 留 3 秒清理，仍未退出则强杀兜底（避免卡死）
+	command('( sleep 3; pgrep -f "[p]asswall-speedtest\\.sh" | xargs kill -9 >/dev/null 2>&1 ) >/dev/null 2>&1 &');
 
 	return {};
 }
@@ -343,7 +322,7 @@ function list_nodes() {
 }
 
 return {
-	cloudflarespeedtest: {
+	'passwall-speedtest': {
 		status: {
 			call: function() {
 				return status();
