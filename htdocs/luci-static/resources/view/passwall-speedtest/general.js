@@ -485,7 +485,11 @@ return view.extend({
 
 			// 联动显隐：ip_source != online 时隐藏「CM IP lists」TableSection
 			// 通过 LuCI CBI 的 data-depends 机制实现，无需页面刷新。
-			// cbi_init() 在 DOMContentLoaded 时已执行，所以这里手动调用 cbi_d_add / cbi_d_update。
+			// cbi_init() 在 DOMContentLoaded 时已执行，所以这里手动调用 cbi_d_add。
+			// 注意：不能在这里调 cbi_d_update()——此时 formNode 尚未挂载到 document，
+			// document.getElementById() 找不到 detached 元素，cbi_tag_last 会因
+			// parent=null 而抛 TypeError。改为手动设置初始显隐；后续用户切换
+			// ip_source 时 cbi_d_update() 正常触发，依赖系统接管。
 			var ipListContainer = null;
 			formNode.querySelectorAll('h2, h3, h4, h5, legend, .cbi-section-title').forEach(function(h) {
 				if (/CM IP lists/.test(h.textContent)) {
@@ -505,9 +509,9 @@ return view.extend({
 					cbi_d_add(ipListContainer,
 						{ 'cbid.passwall-speedtest.global.ip_source': 'online' }, ipListIdx);
 				}
-				if (typeof cbi_d_update === 'function') {
-					cbi_d_update();
-				}
+				// 初始显隐：formNode 尚未挂载，手动设置；后续由 cbi_d_update 接管
+				if (uci.get('passwall-speedtest', 'global', 'ip_source') !== 'online')
+					ipListContainer.style.display = 'none';
 			}
 
 			poll.add(L.bind(this.pollStatus, this, statusNode, actionButton), 3);
