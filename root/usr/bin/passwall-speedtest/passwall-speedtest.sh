@@ -31,6 +31,82 @@ echolog() {
 function read_config(){
     get_global_config "enabled" "custom_cron_enabled" "custom_cron" "tl" "tll" "tlr" "ip_source" "custom_ip_file" "custom_allip" "ip_online_url" "ip_online_regions" "node_test_node" "node_test_url" "node_test_count" "node_test_timeout" "node_test_probes" "node_test_threads"
     get_servers_config "ssr_services" "ssr_enabled" "passwall_enabled" "passwall_services" "passwall2_enabled" "passwall2_services" "bypass_enabled" "bypass_services" "vssr_enabled" "vssr_services" "DNS_enabled" "AliDNS_ip_count" "HOST_enabled" "MosDNS_enabled" "MosDNS_ip_count" "openclash_restart" "AstraDNS_enabled" "AstraDNS_config" "AstraDNS_bin"
+    # 五个 CM 备选 IP 列表（ip_list 命名段 list1..list5）
+    local _n
+    for _n in 1 2 3 4 5; do
+        eval "list${_n}_enabled=\$(uci get passwall-speedtest.list${_n}.enabled 2>/dev/null)"
+        eval "list${_n}_name=\$(uci get passwall-speedtest.list${_n}.name 2>/dev/null)"
+        eval "list${_n}_regions=\$(uci get passwall-speedtest.list${_n}.regions 2>/dev/null)"
+    done
+}
+
+# 迁移：旧配置只有全局 ip_online_regions、无 ip_list 段时，把它写入 list1 作为默认列表。
+# 仅在 ip_source==online 且 list1_regions 为空且 ip_online_regions 非空时执行一次。
+function migrate_ip_online_regions(){
+    [ "${ip_source:-}" = "online" ] || return 0
+    [ -n "${ip_online_regions:-}" ] || return 0
+    [ -z "${list1_regions:-}" ] || return 0
+    uci set passwall-speedtest.list1.enabled='1'
+    uci set passwall-speedtest.list1.regions="${ip_online_regions}"
+    uci commit passwall-speedtest
+    list1_enabled=1
+    list1_regions="${ip_online_regions}"
+    echolog "迁移：将旧 ip_online_regions (${ip_online_regions}) 写入 list1 作为默认 CM IP 列表"
+}
+
+# 读取 node_ip 段（匿名段）→ 建 nodeid→ip_list 映射，存入 shell 变量 node_ip_list_<nodeid>。
+# 用 `uci show` 解析，避免 config_load 扰动 passwall 自身的配置加载状态（config_n_get 依赖它）。
+# node id 形如 cfg0a1b2c，是合法 shell 变量后缀。
+NODE_IP_MAP_LOADED=0
+function read_node_ip_map(){
+    [ "$NODE_IP_MAP_LOADED" = "1" ] && return 0
+    local line _node=""
+    while IFS= read -r line; do
+        # 形如 passwall-speedtest.@node_ip[N].node='cfg0a1b2c' / .ip_list='list2'
+        case "$line" in
+            *".node="*)
+                _node="${line#*.node=}"
+                _node="${_node#\'}"; _node="${_node%\'}"
+                ;;
+            *".ip_list="*)
+                local _list="${line#*.ip_list=}"
+                _list="${_list#\'}"; _list="${_list%\'}"
+                if [ -n "$_node" ]; then
+                    eval "node_ip_list_${_node}=\${_list:-}"
+                fi
+                _node=""
+                ;;
+        esac
+    done <<EOF
+$(uci show passwall-speedtest 2>/dev/null | grep '@node_ip\[')
+EOF
+    NODE_IP_MAP_LOADED=1
+}
+
+# 计算默认列表 = 数字序第一个 enabled=1 的 ip_list（list1..list5）。无启用则空。
+# 必须在主 shell（非 command substitution）里调一次，结果存 DEFAULT_IP_LIST 供 resolve_node_list 复用。
+DEFAULT_IP_LIST=""
+function compute_default_ip_list(){
+    [ -n "$DEFAULT_IP_LIST" ] && return 0
+    local _n _e
+    for _n in 1 2 3 4 5; do
+        eval "_e=\${list${_n}_enabled:-0}"
+        if [ "$_e" = "1" ]; then DEFAULT_IP_LIST="list${_n}"; break; fi
+    done
+}
+
+# 返回某 passwall worker 节点应使用的列表 id（list1..list5），或空（→ 调用方走全量 :443）。
+# 优先 node_ip 段显式指派（且该列表 enabled=1）；否则回退 DEFAULT_IP_LIST。
+# 本函数无副作用、无 echolog，可在 command substitution 内安全调用。
+function resolve_node_list(){
+    local nodeid="$1"
+    local _v _e
+    eval "_v=\${node_ip_list_${nodeid}:-}"
+    if [ -n "$_v" ]; then
+        eval "_e=\${list${_v#list}_enabled:-0}"
+        [ "$_e" = "1" ] && { echo "$_v"; return 0; }
+    fi
+    echo "$DEFAULT_IP_LIST"
 }
 
 function rotate_result_files(){
@@ -89,24 +165,27 @@ function sort_result(){
     [ -s "${file}.sorted" ] && mv -f "${file}.sorted" "$file" || rm -f "${file}.sorted"
 }
 
-# 从在线 CM 源下载候选 IP 列表。源格式: IP:PORT#国家码 (如 1.2.3.4:443#JP)
-# 只保留 :443 行；若 ip_online_regions 非空则按国家码白名单过滤(空格/逗号分隔,留空=全量 :443)；
-# 去端口去重,只留纯 IP,写入 RESULT_DIR/ip_online.txt 并把该路径写入全局变量 ONLINE_IP_FILE。
+# 从在线 CM 源下载原始候选列表。源格式: IP:PORT#国家码 (如 1.2.3.4:443#JP)
+# 只保留 :443# 行。输出两份：
+#   ONLINE_RAW_FULL = 带国家码的 :443#CC 行（去重），供 build_ip_list_file 按国家过滤；
+#   ONLINE_RAW      = 去端口去重的纯 IP，用于 sanity 校验（行数下限、格式占比）。
+# 国家码白名单过滤由 build_ip_list_file 按各 ip_list 的 regions 分别做（一次下载、多次过滤）。
 # 带下载重试、空检查、行数下限、格式校验(参考仓库根 update_cf_ip.sh)。
 # 注意:本函数会被 node_speed_test 直接调用(不在 $(...) 内),故 echolog 的 stdout 日志安全；
 # 路径不通过 echo 返回,避免被 command substitution 捕获日志行污染变量。
-ONLINE_IP_FILE=""
-function fetch_online_ip_file(){
-    ONLINE_IP_FILE=""
+ONLINE_RAW=""
+ONLINE_RAW_FULL=""
+function fetch_online_raw(){
+    ONLINE_RAW=""; ONLINE_RAW_FULL=""
     local src="${ip_online_url:-https://zip.cm.edu.kg/all.txt}"
-    local regions="${ip_online_regions:-}"
     local timeout=30
     local min_lines="${CF_MIN_LINES:-50}"
-    local out="${RESULT_DIR}/ip_online.txt"
+    local out_full="${RESULT_DIR}/ip_online_full.txt"
+    local out="${RESULT_DIR}/ip_online_raw.txt"
     local tmp
     tmp="$(mktemp "${RESULT_DIR}/ip_online.XXXXXX")" || { echolog "创建在线 IP 临时文件失败"; return 1; }
 
-    echolog "下载在线 IP 列表: $src (地区过滤: ${regions:-全量 :443})"
+    echolog "下载在线 CM IP 列表(原始): $src"
     local ok=0 i
     for i in 1 2 3; do
         if curl -fsSL --max-time "$timeout" -o "$tmp" "$src" 2>/dev/null; then ok=1; break; fi
@@ -115,32 +194,54 @@ function fetch_online_ip_file(){
     [ "$ok" = 1 ] || { echolog "下载失败(重试 3 次): $src"; rm -f "$tmp"; return 1; }
     [ -s "$tmp" ] || { echolog "下载内容为空"; rm -f "$tmp"; return 1; }
 
-    # 只保留 :443 行;可选国家码白名单过滤;去端口去重,只留纯 IP
-    if [ -n "$regions" ]; then
-        local re
-        re=$(printf '%s' "$regions" | sed 's/[[:space:],]/|/g')
-        { grep ':443#' "$tmp" | grep -E ":443#($re)$" | sed 's/:.*//' | sort -u || true; } > "${tmp}.new"
-    else
-        { grep ':443#' "$tmp" | sed 's/:.*//' | sort -u || true; } > "${tmp}.new"
-    fi
-    mv -f "${tmp}.new" "$tmp"
+    # 带国家码的 :443# 行（去重）→ ONLINE_RAW_FULL
+    { grep ':443#' "$tmp" | sort -u || true; } > "${out_full}.tmp"
+    # 去端口去重的纯 IP → 用于 sanity 校验
+    { sed 's/:.*//' "${out_full}.tmp" | sort -u || true; } > "${out}.tmp"
 
     local lines good
-    lines=$(wc -l < "$tmp" | tr -d ' ')
+    lines=$(wc -l < "${out}.tmp" | tr -d ' ')
     if [ "$lines" -lt "$min_lines" ]; then
         echolog "在线 IP 行数过少 ($lines < $min_lines),疑似源异常,中止"
-        rm -f "$tmp"; return 1
+        rm -f "$tmp" "${out}.tmp" "${out_full}.tmp"; return 1
     fi
-    good=$(grep -cE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' "$tmp" || true)
+    good=$(grep -cE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' "${out}.tmp" || true)
     if [ "$good" -lt $((lines * 9 / 10)) ]; then
         echolog "在线 IP 格式异常,合法行 $good/$lines 不足 90%,中止"
-        rm -f "$tmp"; return 1
+        rm -f "$tmp" "${out}.tmp" "${out_full}.tmp"; return 1
     fi
 
     mkdir -p "$RESULT_DIR"
-    mv -f "$tmp" "$out"
-    ONLINE_IP_FILE="$out"
-    echolog "在线 IP 列表就绪: $lines 行 -> $out"
+    mv -f "${out_full}.tmp" "$out_full"
+    mv -f "${out}.tmp" "$out"
+    rm -f "$tmp"
+    ONLINE_RAW_FULL="$out_full"
+    ONLINE_RAW="$out"
+    echolog "在线 CM 原始列表就绪: $lines 行 -> $out (带国家码: $out_full)"
+    return 0
+}
+
+# 按 listN 的 regions 从 ONLINE_RAW_FULL 过滤出该列表的候选 IP，写入 RESULT_DIR/ip_list_<N>.txt。
+# regions 为空 = 全量 :443。不对过滤后文件再跑行数下限检查（窄国家可能合法 <50 行；
+# worker 自己的 [ $total -gt 0 ] 会处理空列表）。
+function build_ip_list_file(){
+    local n="$1"
+    local regions
+    eval "regions=\${list${n}_regions:-}"
+    local out="${RESULT_DIR}/ip_list_${n}.txt"
+    local full="${ONLINE_RAW_FULL:-}"
+    [ -n "$full" ] && [ -f "$full" ] || { echolog "在线原始(带国家码)文件缺失，无法过滤 list${n}"; return 1; }
+
+    if [ -n "$regions" ]; then
+        local re
+        re=$(printf '%s' "$regions" | sed 's/[[:space:],]/|/g')
+        { grep -E ":443#($re)$" "$full" | sed 's/:.*//' | sort -u || true; } > "$out"
+    else
+        { sed 's/:.*//' "$full" | sort -u || true; } > "$out"
+    fi
+    local lines
+    lines=$(wc -l < "$out" | tr -d ' ')
+    echolog "CM IP 列表 list${n} 就绪: ${lines} 行 (regions: ${regions:-全量 :443}) -> $out"
     return 0
 }
 
@@ -349,26 +450,53 @@ node_speed_test() {
     case "$threads" in ''|*[!0-9]*) threads=5 ;; esac
     [ "$threads" -ge 0 ] 2>/dev/null || threads=5
 
-    local selected_ip_file
-    if [ "${ip_source:-}" = "online" ]; then
-        # online 源:fetch 直接调用(不在 $(..) 内),避免 echolog 日志行污染路径变量
-        fetch_online_ip_file || return 1
-        selected_ip_file="${ONLINE_IP_FILE}"
-    else
-        selected_ip_file="$(select_ip_file)"
-    fi
-    [ -f "$selected_ip_file" ] || { echolog "候选 IP 列表文件不存在: $selected_ip_file"; return 1; }
+    # ── 候选 IP 来源 ──
     local count="${node_test_count:-30}"
     case "$count" in ''|*[!0-9]*) count=30 ;; esac
     [ "$count" -gt 0 ] || count=30
-    local ip_list total
-    ip_list=$(grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$selected_ip_file" | head -n "$count")
-    total=$(echo "$ip_list" | grep -c .)
-    [ "$total" -gt 0 ] || { echolog "候选 IP 列表为空"; return 1; }
+
+    local ip_source_mode="file"
+    local selected_ip_file=""
+    if [ "${ip_source:-}" = "online" ]; then
+        # online CM 源：一次下载原始列表，按各 ip_list 的 regions 分别过滤成 ip_list_<N>.txt
+        migrate_ip_online_regions
+        fetch_online_raw || return 1
+        read_node_ip_map
+        compute_default_ip_list
+        local _n _e
+        for _n in 1 2 3 4 5; do
+            eval "_e=\${list${_n}_enabled:-0}"
+            [ "$_e" = "1" ] && build_ip_list_file "$_n"
+        done
+        ip_source_mode="online"
+    else
+        selected_ip_file="$(select_ip_file)"
+        [ -f "$selected_ip_file" ] || { echolog "候选 IP 列表文件不存在: $selected_ip_file"; return 1; }
+        ip_source_mode="file"
+    fi
+
+    # 取某 worker 的候选 IP（grep 去注释空行 + head -n count）。无 echolog、可在 $(..) 内用。
+    get_worker_ips(){
+        local nodeid="$1" src_file=""
+        if [ "$ip_source_mode" = "online" ]; then
+            local N
+            N=$(resolve_node_list "$nodeid")
+            if [ -n "$N" ]; then
+                src_file="${RESULT_DIR}/ip_list_${N#list}.txt"
+            else
+                src_file="${ONLINE_RAW:-}"   # 无启用列表 → 全量 :443 原始
+            fi
+        else
+            src_file="$selected_ip_file"
+        fi
+        [ -n "$src_file" ] && [ -f "$src_file" ] || return 1
+        grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$src_file" | head -n "$count"
+    }
 
     NODE_TEST_FLAG_BASE="node_test_$$"
     NODE_TEST_DONE=0
     NODE_TEST_CLEANED=0
+    NODE_TESTED_WORKERS=""
     trap node_test_cleanup EXIT INT TERM
 
     # ── 检测 worker：第三方设置里选的 passwall 节点 ──
@@ -404,8 +532,10 @@ node_speed_test() {
             echolog "第三方设置里的 passwall 节点均不可用，回退单节点串行"
             rm -f "$NT_ORIG_FILE"; NT_ORIG_FILE=""
         else
-            echolog "开始走节点测速（多节点并行: ${widx} 个 worker, 候选: ${total}, 每IP探测 ${probes} 次, 超时 ${timeout}s, 并发上限 ${threads}）"
+            echolog "开始走节点测速（多节点并行: ${widx} 个 worker, 每IP探测 ${probes} 次, 超时 ${timeout}s, 并发上限 ${threads}）"
             echolog "提示：测速期间所有 worker 节点的 address 会被反复改写，这些节点会短暂抖动，测完各写各的最优 IP"
+            # 记录实测过的 worker 集合，供 ip_replace/passwall_best_ip 跳过（保留各节点自己的最优 IP）
+            NODE_TESTED_WORKERS="$valid_workers"
             # 分批并行：每批 threads 个 worker，批内 background、批间 wait
             local launched=0 batch
             [ "$threads" -ge 1 ] 2>/dev/null || threads=$widx
@@ -414,7 +544,14 @@ node_speed_test() {
                 local _rfile="${RESULT_DIR}/result.csv.tmp.$_w"
                 # 端口确定性分配：48900 + idx - 1（每 worker 固定端口，复用于其所有 IP）
                 local _port=$((48900 + launched - 1))
-                node_test_worker "$launched" "$_w" "" "$_rfile" "$ip_list" "$probe_url" "$timeout" "$probes" "$_port" "${NODE_TEST_FLAG_BASE}_$launched" &
+                # 按 worker 取其对应 CM IP 列表（在线模式 per-worker；非在线模式共享 selected_ip_file）
+                local _wips
+                _wips=$(get_worker_ips "$_w") || { echolog "worker 节点 $_w 候选 IP 不可用，跳过"; continue; }
+                local _wtot
+                _wtot=$(echo "$_wips" | grep -c .)
+                [ "$_wtot" -gt 0 ] || { echolog "worker 节点 $_w 候选 IP 为空，跳过"; continue; }
+                [ "$_wtot" -lt "$count" ] && echolog "worker 节点 $_w 候选 IP $_wtot < $count（其 CM 列表偏小）"
+                node_test_worker "$launched" "$_w" "" "$_rfile" "$_wips" "$probe_url" "$timeout" "$probes" "$_port" "${NODE_TEST_FLAG_BASE}_$launched" &
                 # 每 threads 个或最后一个，等本批完成
                 batch=$((launched % threads))
                 if [ "$batch" -eq 0 ] || [ "$launched" -ge "$widx" ]; then
@@ -471,6 +608,14 @@ node_speed_test() {
     fi
     NODE_TEST_ORIG_ADDR=$(config_n_get ${NODE_TEST_NODE} address)
     [ -n "${NODE_TEST_ORIG_ADDR}" ] || { echolog "passwall 节点 ${NODE_TEST_NODE} 未配置 address"; return 1; }
+
+    # 单节点候选 IP（按其 node_ip 指派或默认列表；非在线模式共享 selected_ip_file）
+    local ip_list total
+    ip_list=$(get_worker_ips "${NODE_TEST_NODE}") || { echolog "passwall 节点 ${NODE_TEST_NODE} 候选 IP 不可用"; return 1; }
+    total=$(echo "$ip_list" | grep -c .)
+    [ "$total" -gt 0 ] || { echolog "passwall 节点 ${NODE_TEST_NODE} 候选 IP 列表为空"; return 1; }
+    [ "$total" -lt "$count" ] && echolog "节点 ${NODE_TEST_NODE} 候选 IP $total < $count（其 CM 列表偏小）"
+    NODE_TESTED_WORKERS="${NODE_TEST_NODE}"
 
     echolog "开始走节点测速（单节点串行: ${NODE_TEST_NODE}, 候选: ${total}, 每IP探测 ${probes} 次, 超时 ${timeout}s）"
     echolog "提示：测速期间源节点 ${NODE_TEST_NODE} 的 address 会被反复改写，该节点会短暂抖动，测完写回最优 IP"
@@ -605,8 +750,13 @@ function astra_dns_ip() {
 function passwall_best_ip(){
     if [ "x${passwall_enabled}" == "x1" ] ;then
         echolog "设置passwall IP"
+        # 跳过本次已实测的 worker：它们在 node_speed_test 里已各自写入自己列表内的最优 IP，
+        # 不能被全局最优 IP 覆盖（否则按节点选 CM 列表的意义被抹掉）。
+        # 未实测的 passwall_services 节点（如 SOCKS/无 address 被跳过的）维持原状，不再被误覆写。
+        local tested="${NODE_TESTED_WORKERS:-}"
         for ssrname in $passwall_services
         do
+            case " $tested " in *" $ssrname "*) echolog "跳过 $ssrname（已写入其 CM 列表内的最优 IP）"; continue ;; esac
             echo $ssrname
             uci set passwall.$ssrname.address="${bestip}"
         done

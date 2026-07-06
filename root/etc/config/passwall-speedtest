@@ -27,3 +27,31 @@ config servers 'servers'
 	option AstraDNS_enabled '0'
 	option AstraDNS_config '/etc/astra-dns/named.yaml'
 	option AstraDNS_bin '/usr/bin/astra-dns'
+
+# 五个固定 CM 源备选 IP 列表，共享 ip_online_url，仅 regions 不同。
+# 每个 passwall worker 节点可在「第三方设置」里指派其中一个列表（node_ip 段）。
+# 未指派的 worker 回退到第一个 enabled=1 的列表。
+config ip_list 'list1'
+	option enabled '1'
+	option name 'JP/SG/KR'
+	option regions 'JP SG KR'
+
+config ip_list 'list2'
+	option enabled '0'
+	option name ''
+	option regions ''
+
+config ip_list 'list3'
+	option enabled '0'
+	option name ''
+	option regions ''
+
+config ip_list 'list4'
+	option enabled '0'
+	option name ''
+	option regions ''
+
+config ip_list 'list5'
+	option enabled '0'
+	option name ''
+	option regions ''

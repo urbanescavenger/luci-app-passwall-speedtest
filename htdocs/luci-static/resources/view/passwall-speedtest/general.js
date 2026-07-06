@@ -276,43 +276,10 @@ return view.extend({
 		o.rmempty = false;
 
 		o = s.taboption('basic', form.Value, 'ip_online_url', _('Online source URL'),
-			_('Source list in <code>IP:PORT#country</code> format. Only :443 entries are kept.'));
+			_('Source list in <code>IP:PORT#country</code> format. Only :443 entries are kept. Shared by all 5 CM IP lists below.'));
 		o.depends('ip_source', 'online');
 		o.default = 'https://zip.cm.edu.kg/all.txt';
 		o.rmempty = false;
-
-		o = s.taboption('basic', form.MultiValue, 'ip_online_regions', _('Country filter'),
-			_('Only keep :443 IPs tagged with the selected countries. Leave none selected to keep all :443 IPs. Default JP/SG/KR for mainland reverse-proxy optimization.'));
-		o.depends('ip_source', 'online');
-		o.default = 'JP SG KR';
-		o.value('JP', _('Japan'));
-		o.value('SG', _('Singapore'));
-		o.value('KR', _('South Korea'));
-		o.value('HK', _('Hong Kong'));
-		o.value('TW', _('Taiwan'));
-		o.value('TH', _('Thailand'));
-		o.value('VN', _('Vietnam'));
-		o.value('ID', _('Indonesia'));
-		o.value('PH', _('Philippines'));
-		o.value('MY', _('Malaysia'));
-		o.value('IN', _('India'));
-		o.value('KH', _('Cambodia'));
-		o.value('DE', _('Germany'));
-		o.value('NL', _('Netherlands'));
-		o.value('FR', _('France'));
-		o.value('GB', _('United Kingdom'));
-		o.value('FI', _('Finland'));
-		o.value('SE', _('Sweden'));
-		o.value('CH', _('Switzerland'));
-		o.value('RU', _('Russia'));
-		o.value('TR', _('Turkey'));
-		o.value('UA', _('Ukraine'));
-		o.value('US', _('United States'));
-		o.value('CA', _('Canada'));
-		o.value('BR', _('Brazil'));
-		o.value('AU', _('Australia'));
-		o.value('AE', _('United Arab Emirates'));
-		o.value('ZA', _('South Africa'));
 
 		o = s.taboption('basic', form.Value, 'custom_ip_file', _('Custom IP list file'),
 			_('Enter a local file path, for example: /etc/passwall-speedtest/ip.txt'));
@@ -368,7 +335,7 @@ return view.extend({
 		o.rmempty = false;
 
 		o = s.taboption('basic', form.Value, 'node_test_count', _('Max IPs to test'),
-			_('This mode tests IPs through the node (~3-7s each). Cap the count to avoid long runs; use a smaller IP list or lower this value for faster results. With the online CM source the filtered candidate list may reach hundreds of IPs — raise this value (e.g. 100-300) or only the first N are tested.'));
+			_('This mode tests IPs through the node (~3-7s each). Cap the count to avoid long runs. With the online CM source the cap is applied <strong>per CM IP list, per worker</strong>, so 5 lists × count × workers × probes can multiply quickly — keep count modest unless you need thoroughness.'));
 		o.datatype = 'uinteger';
 		o.default = '30';
 		o.rmempty = false;
@@ -412,6 +379,52 @@ return view.extend({
 		});
 		o.default = '24';
 
+		// ── 五个 CM 备选 IP 列表（共享 ip_online_url，仅国家筛选不同）──
+		// 仅在 ip_source=online 时有意义；通过下面 JS 联动显隐。
+		s = m.section(form.TableSection, 'ip_list', _('CM IP lists (per-country)'),
+			_('Define up to 5 CM-source IP lists. All share the online URL above; each filters by its own country set. Assign one list per passwall worker node in the Third-Party tab. Workers without an explicit list use the first enabled list. Only used when IP list source = Online CM source.'));
+		s.addremove = false;
+		s.anonymous = false;
+		s.nodescriptions = true;
+
+		o = s.option(form.Flag, 'enabled', _('Enabled'));
+		o.rmempty = false;
+
+		o = s.option(form.Value, 'name', _('Name'),
+			_('Display label for this list, shown in the per-node dropdown.'));
+		o.rmempty = true;
+
+		o = s.option(form.MultiValue, 'regions', _('Country filter'),
+			_('Only keep :443 IPs tagged with the selected countries. Leave none selected to keep all :443 IPs.'));
+		o.value('JP', _('Japan'));
+		o.value('SG', _('Singapore'));
+		o.value('KR', _('South Korea'));
+		o.value('HK', _('Hong Kong'));
+		o.value('TW', _('Taiwan'));
+		o.value('TH', _('Thailand'));
+		o.value('VN', _('Vietnam'));
+		o.value('ID', _('Indonesia'));
+		o.value('PH', _('Philippines'));
+		o.value('MY', _('Malaysia'));
+		o.value('IN', _('India'));
+		o.value('KH', _('Cambodia'));
+		o.value('DE', _('Germany'));
+		o.value('NL', _('Netherlands'));
+		o.value('FR', _('France'));
+		o.value('GB', _('United Kingdom'));
+		o.value('FI', _('Finland'));
+		o.value('SE', _('Sweden'));
+		o.value('CH', _('Switzerland'));
+		o.value('RU', _('Russia'));
+		o.value('TR', _('Turkey'));
+		o.value('UA', _('Ukraine'));
+		o.value('US', _('United States'));
+		o.value('CA', _('Canada'));
+		o.value('BR', _('Brazil'));
+		o.value('AU', _('Australia'));
+		o.value('AE', _('United Arab Emirates'));
+		o.value('ZA', _('South Africa'));
+
 		s = m.section(form.NamedSection, 'global', 'global', _('Best IP'));
 		s.addremove = false;
 		o = s.option(form.TextValue, '_best_result');
@@ -446,6 +459,21 @@ return view.extend({
 				formActions.parentNode.insertBefore(chartNode, formActions);
 			else
 				formNode.appendChild(chartNode);
+
+			// 联动显隐：ip_source != online 时隐藏「CM IP lists」TableSection（跨段无法用 depends）
+			const ipSourceSel = formNode.querySelector('[name="cbid.passwall-speedtest.global.ip_source"]');
+			let ipListSection = null;
+			formNode.querySelectorAll('fieldset.cbi-section').forEach(function(fs) {
+				const t = fs.querySelector('h3, legend');
+				if (t && /CM IP lists/.test(t.textContent)) ipListSection = fs;
+			});
+			function toggleIpLists() {
+				if (!ipListSection) return;
+				const v = ipSourceSel ? ipSourceSel.value : '';
+				ipListSection.style.display = (v === 'online') ? '' : 'none';
+			}
+			if (ipSourceSel) ipSourceSel.addEventListener('change', toggleIpLists);
+			toggleIpLists();
 
 			poll.add(L.bind(this.pollStatus, this, statusNode, actionButton), 3);
 

@@ -60,6 +60,29 @@ return view.extend({
 			o.forcewrite = true;
 		}
 
+		// 每个 passwall worker 节点可指派一个 CM IP 列表（仅 ip_source=online 时生效）。
+		// 未列出的 worker 回退到第一个 enabled 的 ip_list。
+		if (nodes.passwall && nodes.passwall.exists) {
+			let ns = m.section(form.TableSection, 'node_ip', _('Per-node IP list (CM source)'),
+				_('Optional: assign one of the 5 CM IP lists (defined on the Plugin Settings page) to each passwall worker node. Only takes effect when IP list source = Online CM source. Worker nodes not listed here use the first enabled CM IP list.'));
+			ns.addremove = true;
+			ns.anonymous = true;
+			ns.nodescriptions = true;
+
+			o = ns.option(form.ListValue, 'node', _('Passwall node'));
+			o.value('', _('-- Please choose --'));
+			addNodeValues(o, nodes.passwall.nodes);
+			o.rmempty = false;
+
+			o = ns.option(form.ListValue, 'ip_list', _('CM IP list'));
+			o.value('', _('-- Default (first enabled) --'));
+			for (let n = 1; n <= 5; n++) {
+				let nm = uci.get('passwall-speedtest', 'list' + n, 'name') || '';
+				o.value('list' + n, nm ? (_('list') + n + ': ' + nm) : (_('list') + n));
+			}
+			o.rmempty = true;
+		}
+
 		if (nodes.passwall2 && nodes.passwall2.exists) {
 			s.tab('passwall2tab', _('passwall2'));
 
