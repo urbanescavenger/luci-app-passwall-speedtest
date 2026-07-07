@@ -292,17 +292,36 @@ return view.extend({
 		actionButton = o;
 		o.onclick = L.bind(function(ev, sectionId) {
 			const button = ev.currentTarget;
+			const statusNode = document.getElementById('passwall-speedtest-status');
+			const view = this;
 			button.disabled = true;
 
 			return callStatus().then(function(st) {
-				return st.running ? callStop() : callStart().then(function() {
-					window.setTimeout(function() {
-						window.location = L.url('admin/services/passwall-speedtest/logread');
-					}, 500);
+				if (!st.running) {
+					// 未运行 → 启动，跳日志页
+					return callStart().then(function() {
+						window.setTimeout(function() {
+							window.location = L.url('admin/services/passwall-speedtest/logread');
+						}, 500);
+					});
+				}
+				// 运行中 → 停止：协作式收尾约 ~timeout×probes，轮询到真正退出再把按钮切回 Start
+				return callStop().then(function() {
+					const waitStopped = function(tries) {
+						tries = tries || 0;
+						return callStatus().then(function(s) {
+							view.updateStatus(statusNode, s);
+							if (s && s.running && tries < 30) {
+								return new Promise(function(r) { window.setTimeout(r, 2000); })
+									.then(function() { return waitStopped(tries + 1); });
+							}
+							view.updateButton(button, s && s.running);
+							return view.refreshResults();
+						});
+					};
+					return waitStopped();
 				});
-			}).then(L.bind(function() {
-				return this.pollStatus(document.getElementById('passwall-speedtest-status'), button);
-			}, this)).catch(function(e) {
+			}).catch(function(e) {
 				ui.addNotification(null, E('p', {}, e.message));
 			}).finally(function() {
 				button.disabled = false;
