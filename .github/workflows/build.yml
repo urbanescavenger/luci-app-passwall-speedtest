@@ -11,10 +11,35 @@ on:
 permissions:
   contents: write
 
+env:
+  PKG: luci-app-passwall-speedtest
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      # tag 触发时把 Makefile 的 PKG_VERSION 注入为 tag 版本号（去掉前导 v），
+      # 使构建产物文件名带真实版本（如 luci-app-passwall-speedtest_2.0.2_all.ipk）。
+      # main 分支构建不改，保持 Makefile 内 PKG_VERSION 字面值（仅作编译校验）。
+      - name: Inject PKG_VERSION from tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=$version/" Makefile
+          echo "Injected PKG_VERSION=$version"
+
+      - name: Get version from Makefile
+        id: get_version
+        run: |
+          version=$(grep 'PKG_VERSION:=' Makefile \
+                    | awk -F ':=' '{print $2}' \
+                    | xargs)
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Current Makefile Version: ${version}"
+
       - name: Resolve latest snapshot SDK URL
         id: snapsdk
         run: |
@@ -24,13 +49,71 @@ jobs:
           echo "url=${base}${file}" >> "$GITHUB_OUTPUT"
           echo "Resolved snapshot SDK: ${base}${file}"
 
-      - name: Build LuCI Package
-        id: build
-        uses: stevenjoezhang/build-luci-app@v1
+      - name: Install system dependencies & po2lmo
+        run: |
+          sudo apt-get update
+          sudo apt install software-properties-common
+          sudo add-apt-repository ppa:deadsnakes/ppa
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive \
+            apt-get install -y curl git tar zstd python3-pip python3.9 python3.9-distutils
+          pip3 install --upgrade pip
+          pip3 install po2lmo
+
+      - name: Download Legacy OpenWrt SDK
+        run: |
+          mkdir -p /tmp/SDK
+          curl -SLk --connect-timeout 30 --retry 2 \
+            "https://archive.openwrt.org/releases/21.02.0/targets/x86/64/openwrt-sdk-21.02.0-x86-64_gcc-8.4.0_musl.Linux-x86_64.tar.xz" \
+            -o /tmp/SDK.tar.xz
+          tar xf /tmp/SDK.tar.xz --strip-components=1 -C /tmp/SDK
+
+      - name: Download Snapshot OpenWrt SDK
+        run: |
+          mkdir -p /tmp/SNAPSDK
+          curl -SLk --connect-timeout 30 --retry 2 \
+            "${{ steps.snapsdk.outputs.url }}" \
+            -o /tmp/SNAPSDK.tar.zst
+          zstd -d /tmp/SNAPSDK.tar.zst
+          tar xf /tmp/SNAPSDK.tar --strip-components=1 -C /tmp/SNAPSDK
+
+      - name: Copy source into SDKs
+        run: |
+          mkdir -p /tmp/SDK/package/${PKG}
+          mkdir -p /tmp/SNAPSDK/package/${PKG}
+          rsync -avh --exclude='.git' . /tmp/SDK/package/${PKG}
+          rsync -avh --exclude='.git' . /tmp/SNAPSDK/package/${PKG}
+
+      - name: Compile IPK with Legacy SDK
+        run: |
+          cd /tmp/SDK
+          ./scripts/feeds update -a
+          ./scripts/feeds install ${PKG}
+          echo "CONFIG_PACKAGE_${PKG}=y" > .config
+          make defconfig
+          make package/${PKG}/compile V=99
+
+      - name: Compile APK with Snapshot SDK
+        run: |
+          cd /tmp/SNAPSDK
+          ./scripts/feeds update -a
+          ./scripts/feeds install ${PKG}
+          echo "CONFIG_PACKAGE_${PKG}=y" > .config
+          make defconfig
+          make package/${PKG}/compile V=99
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p artifacts
+          cp /tmp/SDK/bin/packages/x86_64/base/luci-*_all.ipk "./artifacts/"
+          cp /tmp/SNAPSDK/bin/packages/x86_64/base/luci-*.apk "./artifacts/"
+          echo "v${{ steps.get_version.outputs.version }}" > artifacts/version.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
         with:
-          package: luci-app-passwall-speedtest
-          sdk-url: https://archive.openwrt.org/releases/21.02.0/targets/x86/64/openwrt-sdk-21.02.0-x86-64_gcc-8.4.0_musl.Linux-x86_64.tar.xz
-          snapsdk-url: ${{ steps.snapsdk.outputs.url }}
+          name: LuCI-Package-${{ steps.get_version.outputs.version }}
+          path: artifacts
 
       - name: Create Release
         if: startsWith(github.ref, 'refs/tags/')
