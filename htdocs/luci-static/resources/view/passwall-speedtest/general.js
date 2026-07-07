@@ -492,6 +492,8 @@ return view.extend({
 		return m.render().then(L.bind(function(formNode) {
 			const statusNode = E('p', { id: 'passwall-speedtest-status' }, _('Collecting data...'));
 			this.updateStatus(statusNode, status);
+			// 真实 DOM 按钮（option 对象改 inputtitle 不会更新已渲染 DOM，轮询必须拿 DOM 元素）
+			const domButton = formNode.querySelector('[name="cbid.passwall-speedtest.global._speedtest"]');
 
 			const chartNode = E('div', { 'class': 'cbi-section' }, [
 				E('h3', {}, _('History Charts')),
@@ -547,7 +549,7 @@ return view.extend({
 					ipListContainer.style.display = 'none';
 			}
 
-			poll.add(L.bind(this.pollStatus, this, statusNode, actionButton), 3);
+			poll.add(L.bind(this.pollStatus, this, statusNode, domButton), 3);
 
 			script(L.resource('passwall-speedtest/chart.js')).then(function() {
 				return script(L.resource('passwall-speedtest/chartjs-adapter-date-fns.js'));
