@@ -38,5 +38,5 @@ jobs:
         with:
           files: |
             ./artifacts/*
-          name: Release v${{ steps.build.outputs.version }}
+          name: Release ${{ github.ref_name }}
           tag_name: ${{ github.ref_name }}
