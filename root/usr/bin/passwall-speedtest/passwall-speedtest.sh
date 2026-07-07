@@ -330,8 +330,8 @@ node_test_cleanup() {
         fi
     fi
     rm -f "${NT_ORIG_FILE}" 2>/dev/null
-    # 清理首完成即停用的完成标记（覆盖单节点 inline 路径与中断退出残留）
-    rm -f "${RESULT_DIR}"/result.csv.tmp.*.done "${RESULT_DIR}"/result.csv.tmp.*.end 2>/dev/null
+    # 清理首完成即停用的完成标记与停止标志（覆盖单节点 inline 路径与中断退出残留）
+    rm -f "${RESULT_DIR}"/result.csv.tmp.*.done "${RESULT_DIR}"/result.csv.tmp.*.end "${RESULT_DIR}/.nt_stop" 2>/dev/null
 }
 
 nt_lock_acquire() { while ! mkdir "${NT_LOCKDIR}" 2>/dev/null; do sleep 0.1; done; }
@@ -371,6 +371,8 @@ node_test_worker() {
     echo "IP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码" > "$_rfile"
     printf '%s\n' "$_ips" | while read -r _ip; do
         [ -n "$_ip" ] || continue
+        # 协作式提前停止：主循环首个有效结果完成后写 .nt_stop，本 worker 跑完当前 IP 即停
+        [ -f "${RESULT_DIR}/.nt_stop" ] && { echolog "worker [${_W}] 收到停止信号，跑完当前 IP 即停（已完成 ${_idx2}/${_total}）"; break; }
         _idx2=$((_idx2 + 1))
         # uci set+commit 加锁（防多 worker 并发改 staging 丢更新）
         nt_lock_acquire
@@ -584,6 +586,7 @@ node_speed_test() {
             # worker 完成（写 .end）仅释放并发槽，不触发停止。
             echolog "提示：首个 worker 测出有效结果即终止其余，按已有结果排序"
             NT_RUNNING=""
+            rm -f "${RESULT_DIR}/.nt_stop" 2>/dev/null
             local launched=0 _stop=0 _rfile _t _port _wips _wtot
             [ "$threads" -ge 1 ] 2>/dev/null || threads=$widx
             for _w in $valid_workers; do
@@ -612,14 +615,14 @@ node_speed_test() {
                 if nt_scan_running; then _stop=1; break; fi
                 [ -n "$NT_RUNNING" ] && [ "$_stop" != "1" ] && sleep 0.5
             done
-            # 提前停止：终止残余 worker 并收尸
+            # 提前停止：写停止标志，其余 worker 跑完当前 IP 自行 break 退出，wait 收尸（不 kill）
             if [ "$_stop" = "1" ]; then
-                echolog "首个有效结果 worker 完成，终止其余 worker，按已有结果排序"
-                for _t in $NT_RUNNING; do kill -9 "${_t%%:*}" 2>/dev/null; done
-                wait 2>/dev/null
+                echolog "首个有效结果 worker 完成，其余 worker 跑完当前 IP 即停，按已有结果排序"
+                : > "${RESULT_DIR}/.nt_stop"
+                wait  # 各 worker 自行 break → 写 .done/.end → 正常退出，wait 收尸
             fi
             NT_RUNNING=""
-            rm -f "${RESULT_DIR}"/result.csv.tmp.*.done "${RESULT_DIR}"/result.csv.tmp.*.end 2>/dev/null
+            rm -f "${RESULT_DIR}"/result.csv.tmp.*.done "${RESULT_DIR}"/result.csv.tmp.*.end "${RESULT_DIR}/.nt_stop" 2>/dev/null
             # 各 worker 写回各自最优（串行，单进程无锁）
             local merged="$(mktemp "${RESULT_DIR}/result.csv.merged.XXXXXX")"
             echo "IP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码" > "$merged"
