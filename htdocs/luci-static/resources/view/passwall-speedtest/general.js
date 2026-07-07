@@ -149,9 +149,31 @@ return view.extend({
 
 	pollStatus: function(node, button) {
 		return callStatus().then(L.bind(function(status) {
+			const wasRunning = this._wasRunning;
+			this._wasRunning = !!(status && status.running);
 			this.updateStatus(node, status);
 			this.updateButton(button, status && status.running);
+			// 运行→停止跳变（点停止/定时任务跑完）时，重拉结果与历史并就地刷新，免手动刷新页面
+			if (wasRunning && !this._wasRunning)
+				return this.refreshResults();
 		}, this));
+	},
+
+	// 重拉 Best IP 文本与历史图表，点停止/跑完后无需手动刷新页面即可看到新结果
+	refreshResults: function() {
+		return Promise.all([callBestResult(), callHistory()]).then(L.bind(function(res) {
+			const best = res[0];
+			const history = res[1] || [];
+			const ta = document.getElementById('cbid.passwall-speedtest.global._best_result');
+			if (ta)
+				ta.value = (typeof best == 'string' ? best : (best && best.content) || '');
+			const canvas = document.getElementById('passwall-speedtest-latency-chart');
+			if (canvas && window.Chart) {
+				const ex = Chart.getChart(canvas);
+				if (ex) ex.destroy();
+				this.drawCharts(canvas.closest('.passwall-speedtest-chart-container') || canvas.parentElement, history);
+			}
+		}, this)).catch(function() {});
 	},
 
 	updateButton: function(button, running) {
@@ -252,6 +274,7 @@ return view.extend({
 		const bestResult = data[2] || '';
 		const history = data[3] || [];
 		const nodes = data[4] || {};
+		this._wasRunning = !!(status && status.running);
 		const passwallNodes = (nodes.passwall && nodes.passwall.nodes) || [];
 
 		m = new form.Map('passwall-speedtest', _('PassWall Speed Test'),
