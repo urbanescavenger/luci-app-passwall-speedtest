@@ -29,7 +29,7 @@ echolog() {
 }
 
 function read_config(){
-    get_global_config "enabled" "custom_cron_enabled" "custom_cron" "tl" "tll" "tlr" "ip_source" "custom_ip_file" "custom_allip" "ip_online_url" "ip_online_regions" "node_test_node" "node_test_url" "node_test_count" "node_test_timeout" "node_test_probes" "node_test_threads"
+    get_global_config "enabled" "custom_cron_enabled" "custom_cron" "tl" "tll" "tlr" "ip_source" "custom_ip_file" "custom_allip" "ip_online_url" "ip_online_regions" "node_test_node" "stable_node" "node_test_url" "node_test_count" "node_test_timeout" "node_test_probes" "node_test_threads"
     get_servers_config "ssr_services" "ssr_enabled" "passwall_enabled" "passwall_services" "passwall2_enabled" "passwall2_services" "bypass_enabled" "bypass_services" "vssr_enabled" "vssr_services" "DNS_enabled" "AliDNS_ip_count" "HOST_enabled" "MosDNS_enabled" "MosDNS_ip_count" "openclash_restart" "AstraDNS_enabled" "AstraDNS_config" "AstraDNS_bin"
     # 五个 CM 备选 IP 列表（ip_list 命名段 list1..list5）
     local _n
@@ -299,6 +299,8 @@ NODE_TEST_ORIG_ADDR=""
 NODE_TEST_DONE=0
 NT_LOCKDIR=""
 NT_ORIG_FILE=""
+NT_ORIG_TCP_NODE=""
+NT_TCP_SWITCHED=0
 
 node_test_cleanup() {
     [ "${NODE_TEST_CLEANED:-0}" = "1" ] && return
@@ -329,6 +331,14 @@ node_test_cleanup() {
             echolog "走节点测速被中断或失败，已恢复节点 ${NODE_TEST_NODE} 原 address"
         fi
     fi
+    # 还原 passwall 全局 TCP 节点（无论成功/中断，只要测速前切换过）。成功路径下这次
+    # restart 顺带让被测节点写回的最优 IP 一并生效；中断路径下顺带应用上面的 address 还原。
+    if [ "${NT_TCP_SWITCHED:-0}" = "1" ] && [ -n "${NT_ORIG_TCP_NODE:-}" ]; then
+        uci set passwall.@global[0].tcp_node="${NT_ORIG_TCP_NODE}"
+        uci commit passwall
+        /etc/init.d/passwall restart >/dev/null 2>&1 || echolog "警告：passwall restart 失败，TCP 节点还原可能未实时生效"
+        echolog "已还原 passwall TCP 节点为 ${NT_ORIG_TCP_NODE}"
+    fi
     rm -f "${NT_ORIG_FILE}" 2>/dev/null
     # 清理首完成即停用的完成标记与停止标志（覆盖单节点 inline 路径与中断退出残留）
     rm -f "${RESULT_DIR}"/result.csv.tmp.*.done "${RESULT_DIR}"/result.csv.tmp.*.end "${RESULT_DIR}/.nt_stop" 2>/dev/null
@@ -336,6 +346,23 @@ node_test_cleanup() {
 
 nt_lock_acquire() { while ! mkdir "${NT_LOCKDIR}" 2>/dev/null; do sleep 0.1; done; }
 nt_lock_release() { rmdir "${NT_LOCKDIR}" 2>/dev/null; }
+
+# 测速前切 passwall 全局 TCP 节点到稳定节点；还原由 node_test_cleanup 兜底。
+# tcp_node 变更需 /etc/init.d/passwall restart 才能实时生效；切换在拉起 worker 之前、
+# 还原在所有 worker 结束之后，故 restart 不与 worker 的 app.sh run_socks 并发。
+# 调用前须已通过必填与冲突校验（stable_node 非空且不在待测集合内）。
+nt_switch_tcp_node() {
+    local _s="${stable_node:-}"
+    [ -n "$_s" ] || return 0
+    NT_ORIG_TCP_NODE="$(uci -q get passwall.@global[0].tcp_node 2>/dev/null)"
+    # 已是稳定节点则无需切换（也不置 SWITCHED，cleanup 跳过还原）
+    [ "$_s" = "$NT_ORIG_TCP_NODE" ] && { NT_ORIG_TCP_NODE=""; NT_TCP_SWITCHED=0; return 0; }
+    echolog "切换 passwall TCP 节点到稳定节点 ${_s}（测速期间保护实流量）"
+    uci set passwall.@global[0].tcp_node="${_s}"
+    uci commit passwall
+    /etc/init.d/passwall restart >/dev/null 2>&1 || echolog "警告：passwall restart 失败，TCP 节点切换可能未实时生效"
+    NT_TCP_SWITCHED=1
+}
 
 # 扫描进行中的 worker（全局 NT_RUNNING = 空格分隔的 pid:worker 列表）：
 #   .done 存在 → 该 worker 完成且有有效结果，wait 收尸并从 NT_RUNNING 移除，记为停止触发；
@@ -464,6 +491,8 @@ node_speed_test() {
     # 校验 passwall 已安装
     [ -f /usr/share/passwall/app.sh ] || { echolog "未安装 passwall，无法使用走节点测速"; return 1; }
     [ -f /usr/share/passwall/utils.sh ] || { echolog "缺少 passwall utils.sh，无法使用走节点测速"; return 1; }
+    # 必选项：稳定节点（测速期间把 passwall 全局 TCP 节点切到它，测后还原）
+    [ -n "${stable_node:-}" ] || { echolog "未配置「稳定节点」（必选项），中止走节点测速"; return 1; }
     # passwall 的 utils.sh 会覆盖 LOG_FILE 与 echolog()，先保存再恢复，避免日志写进 passwall 的日志文件
     local _pws_log_file="$LOG_FILE"
     . /usr/share/passwall/utils.sh
@@ -580,6 +609,10 @@ node_speed_test() {
             echolog "提示：测速期间所有 worker 节点的 address 会被反复改写，这些节点会短暂抖动，测完各写各的最优 IP"
             # 记录实测过的 worker 集合，供 ip_replace/passwall_best_ip 跳过（保留各节点自己的最优 IP）
             NODE_TESTED_WORKERS="$valid_workers"
+            # 稳定节点不得在待测 worker 集合内（否则用户实流量仍走被改写地址的节点，切换无意义）
+            case " $valid_workers " in *" ${stable_node} "*) echolog "稳定节点 ${stable_node} 与待测 worker 重叠，中止（稳定节点不得在待测集合内）"; return 1 ;; esac
+            # 拉起 worker 之前切 passwall TCP 节点到稳定节点（测后由 node_test_cleanup 还原）
+            nt_switch_tcp_node
             # 并发上限 + 首个有效结果即停：维持 threads 个并发，轮询各 worker 完成标记；
             # 任一 worker 跑完全部候选 IP 且保留≥1 个有效 IP（写 .done）时，立即终止其余
             # worker，跳到合并阶段按已有（含被杀 worker 的部分）结果排序。无有效结果的
@@ -677,6 +710,8 @@ node_speed_test() {
     fi
     NODE_TEST_ORIG_ADDR=$(config_n_get ${NODE_TEST_NODE} address)
     [ -n "${NODE_TEST_ORIG_ADDR}" ] || { echolog "passwall 节点 ${NODE_TEST_NODE} 未配置 address"; return 1; }
+    # 稳定节点不得为待测节点本身（否则用户实流量仍走被改写地址的节点，切换无意义）
+    [ "${stable_node}" != "${NODE_TEST_NODE}" ] || { echolog "稳定节点与待测节点 ${NODE_TEST_NODE} 相同，中止（稳定节点不得为待测节点）"; return 1; }
 
     # 单节点候选 IP（按其 node_ip 指派或默认列表；非在线模式共享 selected_ip_file）
     local ip_list total
@@ -690,6 +725,8 @@ node_speed_test() {
     echolog "提示：测速期间源节点 ${NODE_TEST_NODE} 的 address 会被反复改写，该节点会短暂抖动，测完写回最优 IP"
 
     result_tmp="$(mktemp "${RESULT_DIR}/result.csv.tmp.XXXXXX")" || { echolog "创建临时测速结果文件失败"; return 1; }
+    # inline 调用 worker 之前切 passwall TCP 节点到稳定节点（测后由 node_test_cleanup 还原）
+    nt_switch_tcp_node
     # 单节点：inline 调用 worker（不 background），端口 48900、flag=base
     node_test_worker 1 "${NODE_TEST_NODE}" "${NODE_TEST_ORIG_ADDR}" "$result_tmp" "$ip_list" "$probe_url" "$timeout" "$probes" 48900 "${NODE_TEST_FLAG_BASE}"
 

@@ -344,6 +344,16 @@ return view.extend({
 		passwallNodes.forEach(function(n) { o.value(n.value, n.label); });
 		o.rmempty = true;
 
+		o = s.taboption('basic', form.ListValue, 'stable_node', _('Passwall stable node (required)'),
+			_('During a speed test, passwall\'s global TCP node is temporarily switched to this stable node and restored afterwards, so your live traffic is unaffected by the tested nodes\' <em>address</em> being rewritten. <strong>Required.</strong> Must NOT equal the tested node (single-node fallback) or any selected passwall worker node.'));
+		o.value('', _('-- Please choose --'));
+		passwallNodes.forEach(function(n) { o.value(n.value, n.label); });
+		o.rmempty = false;
+		o.validate = function(section_id, value) {
+			if (!value || !value.length) return _('Please choose a stable node');
+			return true;
+		};
+
 		o = s.taboption('basic', form.Value, 'node_test_url', _('Probe URL'),
 			_('URL probed via the node\'s local SOCKS; only the HTTP HEAD latency is measured. generate_204 / connectivity-check endpoints are preferred.'));
 		o.default = 'https://www.google.com/generate_204';
