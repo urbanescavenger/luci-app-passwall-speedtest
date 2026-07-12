@@ -220,9 +220,9 @@ function get_best_result() {
 	};
 }
 
-function add_node(nodes, name, label) {
+function add_node(nodes, name, label, type) {
 	if (name)
-		push(nodes, { value: name, label: label || name });
+		push(nodes, { value: name, label: label || name, type: type || '' });
 }
 
 function load_config(cur, name) {
@@ -268,7 +268,7 @@ function list_nodes() {
 	if (load_config(cur, 'passwall')) {
 		cur.foreach('passwall', 'nodes', s => {
 			if (s.remarks)
-				add_node(nodes, s['.name'], `[${uc(s.protocol || s.type || '')}]:${s.remarks}`);
+				add_node(nodes, s['.name'], `[${uc(s.protocol || s.type || '')}]:${s.remarks}`, uc(s.type || ''));
 		});
 		result.passwall = { exists: true, nodes: sorted_nodes(nodes) };
 	}
@@ -280,7 +280,7 @@ function list_nodes() {
 	if (load_config(cur, 'passwall2')) {
 		cur.foreach('passwall2', 'nodes', s => {
 			if (s.remarks)
-				add_node(nodes, s['.name'], `[${uc(s.protocol || s.type || '')}]:${s.remarks}`);
+				add_node(nodes, s['.name'], `[${uc(s.protocol || s.type || '')}]:${s.remarks}`, uc(s.type || ''));
 		});
 		result.passwall2 = { exists: true, nodes: sorted_nodes(nodes) };
 	}

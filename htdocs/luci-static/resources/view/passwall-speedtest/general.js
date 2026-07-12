@@ -383,13 +383,13 @@ return view.extend({
 		o = s.taboption('basic', form.ListValue, 'node_test_node', _('Passwall node to test through (single-node fallback)'),
 			_('Used only when no passwall workers are selected in the Third-Party tab. Select a CF-CDN-fronted passwall node (VLESS/VMess/Trojan/SS…). Its <em>address</em> will be cycled through candidate IPs and finally set to the fastest one. SOCKS-type nodes are not supported.'));
 		o.value('', _('-- Please choose --'));
-		passwallNodes.forEach(function(n) { o.value(n.value, n.label); });
+		passwallNodes.forEach(function(n) { if (String(n.type || '').toLowerCase() !== 'socks') o.value(n.value, n.label); });
 		o.rmempty = true;
 
 		o = s.taboption('basic', form.ListValue, 'stable_node', _('Passwall stable node (required)'),
 			_('During a speed test, passwall\'s global TCP node is temporarily switched to this stable node and restored afterwards, so your live traffic is unaffected by the tested nodes\' <em>address</em> being rewritten. <strong>Required.</strong> Must NOT equal the tested node (single-node fallback) or any selected passwall worker node.'));
 		o.value('', _('-- Please choose --'));
-		passwallNodes.forEach(function(n) { o.value(n.value, n.label); });
+		passwallNodes.forEach(function(n) { if (String(n.type || '').toLowerCase() !== 'socks') o.value(n.value, n.label); });
 		o.rmempty = false;
 		o.validate = function(section_id, value) {
 			if (!value || !value.length) return _('Please choose a stable node');

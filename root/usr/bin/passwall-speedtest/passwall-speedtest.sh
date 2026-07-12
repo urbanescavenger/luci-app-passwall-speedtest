@@ -301,6 +301,23 @@ NT_LOCKDIR=""
 NT_ORIG_FILE=""
 NT_ORIG_TCP_NODE=""
 NT_TCP_SWITCHED=0
+NT_SNAP_FILE=""
+NT_SNAPSHOT_REAPPLIED=0
+
+# 测前快照 /etc/config/passwall，测后还原以抹掉 passwall 在测速中途新增的异常节点段
+# （passwall 自身 restart/订阅刷新会偶发重建自带 socks 节点；脚本无法控制，靠整份快照兜底）。
+nt_snapshot() {
+    NT_SNAP_FILE="$(mktemp "${RESULT_DIR}/passwall_snap.XXXXXX")" || { echolog "创建 passwall 快照失败"; NT_SNAP_FILE=""; return 1; }
+    cp /etc/config/passwall "${NT_SNAP_FILE}" 2>/dev/null || { echolog "快照 /etc/config/passwall 失败"; rm -f "${NT_SNAP_FILE}"; NT_SNAP_FILE=""; return 1; }
+}
+
+# 整份还原快照（不重放任何 address）：用于失败/中断/结果为空路径，回滚本次测速所有改动。
+nt_rollback() {
+    [ -n "${NT_SNAP_FILE}" ] && [ -f "${NT_SNAP_FILE}" ] || return 0
+    cp "${NT_SNAP_FILE}" /etc/config/passwall 2>/dev/null || echolog "警告：还原 passwall 快照失败"
+    /etc/init.d/passwall restart >/dev/null 2>&1 || echolog "警告：passwall restart 失败，回滚可能未实时生效"
+    echolog "已还原 passwall 配置到测速前快照（回滚本次测速所有改动，清理中途新增的异常节点）"
+}
 
 node_test_cleanup() {
     [ "${NODE_TEST_CLEANED:-0}" = "1" ] && return
@@ -315,31 +332,12 @@ node_test_cleanup() {
         rm -rf /tmp/etc/passwall/*"${NODE_TEST_FLAG_BASE}"* 2>/dev/null
     fi
     rmdir "${NT_LOCKDIR}" 2>/dev/null
-    # 未正常完成时恢复节点 address：多线程从映射文件恢复所有 worker，单节点恢复 NODE_TEST_NODE
-    if [ "${NODE_TEST_DONE:-0}" != "1" ]; then
-        if [ -n "${NT_ORIG_FILE}" ] && [ -f "${NT_ORIG_FILE}" ]; then
-            local idx w orig
-            while read -r idx w orig; do
-                [ -n "$w" ] || continue
-                uci set passwall.${w}.address="${orig}"
-            done < "${NT_ORIG_FILE}"
-            uci commit passwall
-            echolog "走节点测速被中断或失败，已按映射文件恢复所有 worker 节点原 address"
-        elif [ -n "${NODE_TEST_NODE}" ] && [ -n "${NODE_TEST_ORIG_ADDR}" ]; then
-            uci set passwall.${NODE_TEST_NODE}.address="${NODE_TEST_ORIG_ADDR}"
-            uci commit passwall
-            echolog "走节点测速被中断或失败，已恢复节点 ${NODE_TEST_NODE} 原 address"
-        fi
+    # 成功路径已由 success 代码自行「还原快照 + 重放 address + restart」并置
+    # NT_SNAPSHOT_REAPPLIED=1，此处跳过；失败/中断/结果为空路径走整份回滚（含 address 与 tcp_node）。
+    if [ "${NT_SNAPSHOT_REAPPLIED:-0}" != "1" ]; then
+        nt_rollback
     fi
-    # 还原 passwall 全局 TCP 节点（无论成功/中断，只要测速前切换过）。成功路径下这次
-    # restart 顺带让被测节点写回的最优 IP 一并生效；中断路径下顺带应用上面的 address 还原。
-    if [ "${NT_TCP_SWITCHED:-0}" = "1" ] && [ -n "${NT_ORIG_TCP_NODE:-}" ]; then
-        uci set passwall.@global[0].tcp_node="${NT_ORIG_TCP_NODE}"
-        uci commit passwall
-        /etc/init.d/passwall restart >/dev/null 2>&1 || echolog "警告：passwall restart 失败，TCP 节点还原可能未实时生效"
-        echolog "已还原 passwall TCP 节点为 ${NT_ORIG_TCP_NODE}"
-    fi
-    rm -f "${NT_ORIG_FILE}" 2>/dev/null
+    rm -f "${NT_SNAP_FILE}" "${NT_ORIG_FILE}" 2>/dev/null
     # 清理首完成即停用的完成标记与停止标志（覆盖单节点 inline 路径与中断退出残留）
     rm -f "${RESULT_DIR}"/result.csv.tmp.*.done "${RESULT_DIR}"/result.csv.tmp.*.end "${RESULT_DIR}/.nt_stop" 2>/dev/null
 }
@@ -351,9 +349,15 @@ nt_lock_release() { rmdir "${NT_LOCKDIR}" 2>/dev/null; }
 # tcp_node 变更需 /etc/init.d/passwall restart 才能实时生效；切换在拉起 worker 之前、
 # 还原在所有 worker 结束之后，故 restart 不与 worker 的 app.sh run_socks 并发。
 # 调用前须已通过必填与冲突校验（stable_node 非空且不在待测集合内）。
+# 返回 1 = 稳定节点非法（不存在或为 socks 类型，与待测节点禁 socks 的校验对称），调用方应中止。
 nt_switch_tcp_node() {
     local _s="${stable_node:-}"
     [ -n "$_s" ] || return 0
+    # 稳定节点须存在且非 socks（其 address 即 SOCKS 服务器，作全局 TCP 出口意义不符）
+    local _st
+    _st=$(config_n_get "$_s" type)
+    [ -n "$_st" ] || { echolog "稳定节点 ${_s} 不存在或无 type，中止"; return 1; }
+    case "$(echo "$_st" | tr 'A-Z' 'a-z')" in socks) echolog "稳定节点 ${_s} 是 SOCKS 类型，中止（稳定节点须为 CF-CDN 前置代理）"; return 1 ;; esac
     NT_ORIG_TCP_NODE="$(uci -q get passwall.@global[0].tcp_node 2>/dev/null)"
     # 已是稳定节点则无需切换（也不置 SWITCHED，cleanup 跳过还原）
     [ "$_s" = "$NT_ORIG_TCP_NODE" ] && { NT_ORIG_TCP_NODE=""; NT_TCP_SWITCHED=0; return 0; }
@@ -611,8 +615,10 @@ node_speed_test() {
             NODE_TESTED_WORKERS="$valid_workers"
             # 稳定节点不得在待测 worker 集合内（否则用户实流量仍走被改写地址的节点，切换无意义）
             case " $valid_workers " in *" ${stable_node} "*) echolog "稳定节点 ${stable_node} 与待测 worker 重叠，中止（稳定节点不得在待测集合内）"; return 1 ;; esac
+            # 测前快照 /etc/config/passwall：测后还原以抹掉 passwall 测速中途新增的异常节点段
+            nt_snapshot || { echolog "passwall 快照失败，中止"; return 1; }
             # 拉起 worker 之前切 passwall TCP 节点到稳定节点（测后由 node_test_cleanup 还原）
-            nt_switch_tcp_node
+            nt_switch_tcp_node || { echolog "稳定节点非法，中止"; node_test_cleanup; trap - EXIT INT TERM; return 1; }
             # 并发上限 + 首个有效结果即停：维持 threads 个并发，轮询各 worker 完成标记；
             # 任一 worker 跑完全部候选 IP 且保留≥1 个有效 IP（写 .done）时，立即终止其余
             # worker，跳到合并阶段按已有（含被杀 worker 的部分）结果排序。无有效结果的
@@ -657,7 +663,9 @@ node_speed_test() {
             NT_RUNNING=""
             rm -f "${RESULT_DIR}"/result.csv.tmp.*.done "${RESULT_DIR}"/result.csv.tmp.*.end "${RESULT_DIR}/.nt_stop" 2>/dev/null
             # 各 worker 写回各自最优（串行，单进程无锁）
-            local merged="$(mktemp "${RESULT_DIR}/result.csv.merged.XXXXXX")"
+            local merged reapply
+            merged="$(mktemp "${RESULT_DIR}/result.csv.merged.XXXXXX")"
+            reapply="$(mktemp "${RESULT_DIR}/node_test_reapply.XXXXXX")"
             echo "IP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码" > "$merged"
             local mi mw morig mwfile mwbest
             while read -r mi mw morig; do
@@ -668,31 +676,49 @@ node_speed_test() {
                 sort_result "$mwfile" latency
                 mwbest=$(first_result_ip "$mwfile")
                 if [ -n "$mwbest" ]; then
-                    uci set passwall.${mw}.address="${mwbest}"
-                    echolog "走节点测速完成 [${mw}]，最优 IP ${mwbest} 已写入 passwall 节点 ${mw}"
+                    printf '%s\t%s\n' "$mw" "$mwbest" >> "$reapply"
+                    echolog "走节点测速完成 [${mw}]，最优 IP ${mwbest} 待写回 passwall 节点"
                 else
-                    uci set passwall.${mw}.address="${morig}"
-                    echolog "走节点测速 [${mw}] 结果为空，恢复原 address"
+                    echolog "走节点测速 [${mw}] 结果为空，保留原 address"
                 fi
                 # awk 过滤丢掉被杀 worker kill -9 中途截断的脏行（NF<7），正常 7 列行等价
                 sed '1d' "$mwfile" 2>/dev/null | awk -F, 'NF>=7 && $1!=""' >> "$merged"
                 rm -f "$mwfile"
             done < "$NT_ORIG_FILE"
-            uci commit passwall
-            rm -f "$NT_ORIG_FILE"; NT_ORIG_FILE=""
+            rm -f "${NT_ORIG_FILE}"; NT_ORIG_FILE=""
             # 合并结果按延迟升序排，供 UI/图表展示（首行=全局最低延迟，供 DNS/host 用）
             sort_result "$merged" latency
             if [ -z "$(first_result_ip "$merged")" ]; then
                 echolog "走节点测速所有 worker 结果均为空，保留上一次结果"
-                rm -f "$merged"
-                NODE_TEST_DONE=1; node_test_cleanup; trap - EXIT INT TERM
+                rm -f "$merged" "$reapply"
+                node_test_cleanup; trap - EXIT INT TERM
                 return 1
             fi
             echo "# Speed test time: $(date +'%Y-%m-%d %H:%M:%S')" >> "$merged"
             rotate_result_files
             mv -f "$merged" "$IP_FILE"
             bestip=$(first_result_ip "$IP_FILE")
-            [ -n "$bestip" ] && echolog "走节点测速全部完成，全局最低延迟 IP ${bestip}（已写入各 worker 节点）"
+            # ── 还原快照 → 抹掉 passwall 测速中途新增的异常节点段，再只重放本次应有的 address ──
+            # tcp_node 在快照里就是测前原值，cp 还原即已还原；一次 restart 同时让各 worker 最优
+            # IP + 原始 tcp_node 生效。
+            if [ -n "${NT_SNAP_FILE}" ] && [ -f "${NT_SNAP_FILE}" ]; then
+                cp "${NT_SNAP_FILE}" /etc/config/passwall 2>/dev/null || echolog "警告：还原快照失败"
+                while read -r mw mbest; do
+                    [ -n "$mw" ] && [ -n "$mbest" ] || continue
+                    # 守护：被测 worker 在快照里仍存在（防订阅更新重排后写空段）
+                    [ -n "$(uci -q get passwall.${mw}.type 2>/dev/null)" ] || { echolog "worker ${mw} 在快照中已不存在，跳过写回"; continue; }
+                    uci set passwall.${mw}.address="${mbest}"
+                done < "$reapply"
+                uci commit passwall
+                /etc/init.d/passwall restart >/dev/null 2>&1 || echolog "警告：passwall restart 失败，最优 IP 可能未实时生效"
+                NT_SNAPSHOT_REAPPLIED=1
+                [ -n "$bestip" ] && echolog "走节点测速全部完成，全局最低延迟 IP ${bestip}（已写回各 worker 节点；已清理测速期间 passwall 新增的异常节点）"
+            else
+                # 无快照（极少见：nt_snapshot 失败）回退：直接提交本进程 staging
+                uci commit passwall
+                [ -n "$bestip" ] && echolog "走节点测速完成，全局最低延迟 IP ${bestip}（警告：无快照，未清理 passwall 异常节点）"
+            fi
+            rm -f "$reapply"
             NODE_TEST_DONE=1; node_test_cleanup; trap - EXIT INT TERM
             return 0
         fi
@@ -713,6 +739,9 @@ node_speed_test() {
     # 稳定节点不得为待测节点本身（否则用户实流量仍走被改写地址的节点，切换无意义）
     [ "${stable_node}" != "${NODE_TEST_NODE}" ] || { echolog "稳定节点与待测节点 ${NODE_TEST_NODE} 相同，中止（稳定节点不得为待测节点）"; return 1; }
 
+    # 测前快照 /etc/config/passwall：测后还原以抹掉 passwall 测速中途新增的异常节点段
+    nt_snapshot || { echolog "passwall 快照失败，中止"; return 1; }
+
     # 单节点候选 IP（按其 node_ip 指派或默认列表；非在线模式共享 selected_ip_file）
     local ip_list total
     ip_list=$(get_worker_ips "${NODE_TEST_NODE}") || { echolog "passwall 节点 ${NODE_TEST_NODE} 候选 IP 不可用"; return 1; }
@@ -726,16 +755,14 @@ node_speed_test() {
 
     result_tmp="$(mktemp "${RESULT_DIR}/result.csv.tmp.XXXXXX")" || { echolog "创建临时测速结果文件失败"; return 1; }
     # inline 调用 worker 之前切 passwall TCP 节点到稳定节点（测后由 node_test_cleanup 还原）
-    nt_switch_tcp_node
+    nt_switch_tcp_node || { echolog "稳定节点非法，中止"; node_test_cleanup; trap - EXIT INT TERM; return 1; }
     # 单节点：inline 调用 worker（不 background），端口 48900、flag=base
     node_test_worker 1 "${NODE_TEST_NODE}" "${NODE_TEST_ORIG_ADDR}" "$result_tmp" "$ip_list" "$probe_url" "$timeout" "$probes" 48900 "${NODE_TEST_FLAG_BASE}"
 
     if [ -z "$(first_result_ip "$result_tmp")" ]; then
-        echolog "走节点测速结果 IP 数量为 0，恢复源节点原 address 并保留上一次结果"
+        echolog "走节点测速结果 IP 数量为 0，整份回滚并保留上一次结果"
         rm -f "$result_tmp"
-        uci set passwall.${NODE_TEST_NODE}.address="${NODE_TEST_ORIG_ADDR}"
-        uci commit passwall
-        NODE_TEST_DONE=1; node_test_cleanup; trap - EXIT INT TERM
+        node_test_cleanup; trap - EXIT INT TERM
         return 1
     fi
 
@@ -744,10 +771,14 @@ node_speed_test() {
     mv -f "$result_tmp" "$IP_FILE"
 
     bestip=$(first_result_ip "$IP_FILE")
-    if [ -n "${bestip}" ]; then
-        uci set passwall.${NODE_TEST_NODE}.address="${bestip}"
+    # ── 还原快照 → 抹掉 passwall 测速中途新增的异常节点段，再只写回本节点最优 IP ──
+    if [ -n "${bestip}" ] && [ -n "${NT_SNAP_FILE}" ] && [ -f "${NT_SNAP_FILE}" ]; then
+        cp "${NT_SNAP_FILE}" /etc/config/passwall 2>/dev/null || echolog "警告：还原快照失败"
+        [ -n "$(uci -q get passwall.${NODE_TEST_NODE}.type 2>/dev/null)" ] && uci set passwall.${NODE_TEST_NODE}.address="${bestip}"
         uci commit passwall
-        echolog "走节点测速完成，最优 IP ${bestip} 已写入 passwall 节点 ${NODE_TEST_NODE}"
+        /etc/init.d/passwall restart >/dev/null 2>&1 || echolog "警告：passwall restart 失败，最优 IP 可能未实时生效"
+        NT_SNAPSHOT_REAPPLIED=1
+        echolog "走节点测速完成，最优 IP ${bestip} 已写入 passwall 节点 ${NODE_TEST_NODE}（已清理测速期间 passwall 新增的异常节点）"
     fi
 
     NODE_TEST_DONE=1; node_test_cleanup; trap - EXIT INT TERM
