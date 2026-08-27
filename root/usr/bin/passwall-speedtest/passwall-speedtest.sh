@@ -29,7 +29,7 @@ echolog() {
 }
 
 function read_config(){
-    get_global_config "enabled" "custom_cron_enabled" "custom_cron" "tl" "tll" "tlr" "ip_source" "custom_ip_file" "custom_allip" "ip_online_url" "ip_online_regions" "node_test_node" "stable_node" "node_test_url" "node_test_count" "node_test_timeout" "node_test_probes" "node_test_threads"
+    get_global_config "enabled" "custom_cron_enabled" "custom_cron" "tl" "tll" "tlr" "ip_source" "custom_ip_file" "custom_allip" "ip_online_url" "ip_online_regions" "node_test_node" "stable_node" "node_test_url" "node_test_count" "node_test_timeout" "node_test_probes" "node_test_threads" "iterate_enabled" "iterate_minutes"
     get_servers_config "ssr_services" "ssr_enabled" "passwall_enabled" "passwall_services" "passwall2_enabled" "passwall2_services" "bypass_enabled" "bypass_services" "vssr_enabled" "vssr_services" "DNS_enabled" "AliDNS_ip_count" "HOST_enabled" "MosDNS_enabled" "MosDNS_ip_count" "openclash_restart" "AstraDNS_enabled" "AstraDNS_config" "AstraDNS_bin"
     # 五个 CM 备选 IP 列表（ip_list 命名段 list1..list5）
     local _n
@@ -277,11 +277,62 @@ function select_ip_file(){
 }
 
 function speed_test(){
+    # 日志只在整次测速入口清一次（迭代模式下每轮都清会把进度日志抹掉）
+    rm -rf $LOG_FILE
     # 走节点测速：把候选 CF IP 写进 passwall 节点 address，用 passwall app.sh run_socks
     # 拉本地 SOCKS，curl -I 取 time_pretransfer 测延迟，多 worker 并行、多 probe fail-fast。
     # 结果写回各 passwall worker 节点。
+    if [ "${iterate_enabled:-0}" = "1" ]; then
+        case "${iterate_minutes:-}" in ''|*[!0-9]*) echolog "迭代测速时长无效，中止"; return 1 ;; esac
+        [ "${iterate_minutes}" -ge 1 ] 2>/dev/null || { echolog "迭代测速时长须 ≥1 分钟，中止"; return 1; }
+        iterate_speed_test
+        return $?
+    fi
     node_speed_test
     return $?
+}
+
+# ── 时间盒迭代测速 ──────────────────────────────────────────
+# 反复调用 node_speed_test，直到累计时长达到 iterate_minutes 分钟。
+# 各待测节点彼此独立：每轮合并阶段按节点把各自通过 IP 提取到
+# RESULT_DIR/iterate_pass_<节点>，下一轮 get_worker_ips 对每个待测节点只保留
+# 其自己上轮通过的 IP（∩ 其候选源），各节点候选池独立逐轮收敛。
+# 每轮都是完整测速：各节点写回各自最优 IP、result.csv 滚动落盘，日志/历史逐轮可见。
+# 停止：UI「停止」写 .iter_stop（配合 .nt_stop 结束当前轮），轮间检测到即不再开新轮。
+function iterate_speed_test(){
+    ITERATE_MODE=1
+    rm -f "${RESULT_DIR}/.iter_stop" "${RESULT_DIR}"/iterate_pass_* 2>/dev/null
+    local deadline=$(( $(date +%s) + iterate_minutes * 60 ))
+    local started=$(date +%s)
+    local round=0 remain kept
+    while :; do
+        remain=$(( deadline - $(date +%s) ))
+        [ "$remain" -le 0 ] && break
+        if [ -f "${RESULT_DIR}/.iter_stop" ]; then
+            echolog "收到停止信号，迭代测速在第 $((round + 1)) 轮前结束（共完成 ${round} 轮）"
+            break
+        fi
+        round=$((round + 1))
+        if [ "$round" -gt 1 ]; then
+            # 候选列表本轮已就绪，跳过重复下载/重建（文件型来源本身无下载）
+            ITERATE_REUSE_LISTS=1
+            kept=$(cat "${RESULT_DIR}"/iterate_pass_* 2>/dev/null | grep -c . || true)
+            echolog "════ 迭代测速第 ${round} 轮（剩余 ${remain}s，各待测节点只测上轮各自通过的 IP，共 ${kept} 个）════"
+        else
+            echolog "════ 迭代测速第 1 轮（时长上限 ${iterate_minutes} 分钟）════"
+        fi
+        if ! node_speed_test; then
+            if [ "$round" -eq 1 ]; then
+                echolog "第 ${round} 轮测速失败，迭代测速中止"
+                return 1
+            fi
+            echolog "第 ${round} 轮测速失败（无有效结果），保留上轮各自通过列表，剩余时间内继续"
+            continue
+        fi
+        echolog "第 ${round} 轮完成"
+    done
+    echolog "迭代测速结束：共 ${round} 轮，累计 $(( $(date +%s) - started ))s"
+    return 0
 }
 
 # ── 走节点测速 ──────────────────────────────────────────────
@@ -507,7 +558,6 @@ node_speed_test() {
         echo -e "$d: $*" >>$LOG_FILE
     }
 
-    rm -rf $LOG_FILE
     mkdir -p "$RESULT_DIR"
 
     # 公共参数
@@ -531,14 +581,19 @@ node_speed_test() {
     local selected_ip_file=""
     if [ "${ip_source:-}" = "online" ]; then
         # online CM 源：一次下载原始列表，按各 ip_list 的 regions 分别过滤成 ip_list_<N>.txt
-        migrate_ip_online_regions
-        fetch_online_raw || return 1
-        compute_default_ip_list
-        local _n _e
-        for _n in 1 2 3 4 5; do
-            eval "_e=\${list${_n}_enabled:-0}"
-            [ "$_e" = "1" ] && build_ip_list_file "$_n"
-        done
+        # 迭代模式第 2 轮起跳过重复下载/重建（列表本轮内不变，文件仍在 RESULT_DIR）
+        if [ "${ITERATE_REUSE_LISTS:-0}" = "1" ]; then
+            echolog "迭代模式：复用本轮已下载的在线 CM IP 列表"
+        else
+            migrate_ip_online_regions
+            fetch_online_raw || return 1
+            compute_default_ip_list
+            local _n _e
+            for _n in 1 2 3 4 5; do
+                eval "_e=\${list${_n}_enabled:-0}"
+                [ "$_e" = "1" ] && build_ip_list_file "$_n"
+            done
+        fi
         ip_source_mode="online"
     else
         selected_ip_file="$(select_ip_file)"
@@ -551,8 +606,10 @@ node_speed_test() {
     read_node_ip_map
 
     # 取某 worker 的候选 IP（grep 去注释空行 + head -n count）。无 echolog、可在 $(..) 内用。
+    # 迭代模式（ITERATE_MODE=1）时再 ∩ 该 worker 上轮通过的 IP（iterate_pass_<节点>），
+    # 只测上轮通过者；首轮无该文件 → 全量候选。
     get_worker_ips(){
-        local nodeid="$1" src_file=""
+        local nodeid="$1" src_file="" prev_file=""
         if [ "$ip_source_mode" = "online" ]; then
             local N
             N=$(resolve_node_list "$nodeid")
@@ -565,6 +622,13 @@ node_speed_test() {
             src_file="$selected_ip_file"
         fi
         [ -n "$src_file" ] && [ -f "$src_file" ] || return 1
+        if [ "${ITERATE_MODE:-0}" = "1" ]; then
+            prev_file="${RESULT_DIR}/iterate_pass_${nodeid}"
+            if [ -s "$prev_file" ]; then
+                grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$src_file" | grep -Fxf "$prev_file" | head -n "$count"
+                return 0
+            fi
+        fi
         grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$src_file" | head -n "$count"
     }
 
@@ -645,7 +709,7 @@ node_speed_test() {
                 _wips=$(get_worker_ips "$_w") || { echolog "worker 节点 $_w 候选 IP 不可用，跳过"; continue; }
                 _wtot=$(echo "$_wips" | grep -c .)
                 [ "$_wtot" -gt 0 ] || { echolog "worker 节点 $_w 候选 IP 为空，跳过"; continue; }
-                [ "$_wtot" -lt "$count" ] && echolog "worker 节点 $_w 候选 IP $_wtot < $count（其 CM 列表偏小）"
+                [ "$_wtot" -lt "$count" ] && [ "${ITERATE_MODE:-0}" != "1" ] && echolog "worker 节点 $_w 候选 IP $_wtot < $count（其 CM 列表偏小）"
                 node_test_worker "$launched" "$_w" "" "$_rfile" "$_wips" "$probe_url" "$timeout" "$probes" "$_port" "${NODE_TEST_FLAG_BASE}_$launched" &
                 NT_RUNNING="${NT_RUNNING:+$NT_RUNNING }$!:${_w}"
             done
@@ -683,6 +747,9 @@ node_speed_test() {
                 fi
                 # awk 过滤丢掉被杀 worker kill -9 中途截断的脏行（NF<7），正常 7 列行等价
                 sed '1d' "$mwfile" 2>/dev/null | awk -F, 'NF>=7 && $1!=""' >> "$merged"
+                # 迭代模式：提取该 worker 本轮通过 IP，供下一轮 get_worker_ips 独立过滤
+                [ "${ITERATE_MODE:-0}" = "1" ] && \
+                    sed -n '2,$p' "$mwfile" 2>/dev/null | grep -v '^#' | awk -F, 'NF>=7 && $1!="" {print $1}' > "${RESULT_DIR}/iterate_pass_${mw}"
                 rm -f "$mwfile"
             done < "$NT_ORIG_FILE"
             rm -f "${NT_ORIG_FILE}"; NT_ORIG_FILE=""
@@ -747,7 +814,7 @@ node_speed_test() {
     ip_list=$(get_worker_ips "${NODE_TEST_NODE}") || { echolog "passwall 节点 ${NODE_TEST_NODE} 候选 IP 不可用"; return 1; }
     total=$(echo "$ip_list" | grep -c .)
     [ "$total" -gt 0 ] || { echolog "passwall 节点 ${NODE_TEST_NODE} 候选 IP 列表为空"; return 1; }
-    [ "$total" -lt "$count" ] && echolog "节点 ${NODE_TEST_NODE} 候选 IP $total < $count（其 CM 列表偏小）"
+    [ "$total" -lt "$count" ] && [ "${ITERATE_MODE:-0}" != "1" ] && echolog "节点 ${NODE_TEST_NODE} 候选 IP $total < $count（其 CM 列表偏小）"
     NODE_TESTED_WORKERS="${NODE_TEST_NODE}"
 
     echolog "开始走节点测速（单节点串行: ${NODE_TEST_NODE}, 候选: ${total}, 每IP探测 ${probes} 次, 超时 ${timeout}s）"
@@ -765,6 +832,10 @@ node_speed_test() {
         node_test_cleanup; trap - EXIT INT TERM
         return 1
     fi
+
+    # 迭代模式：提取本节点本轮通过 IP，供下一轮 get_worker_ips 独立过滤
+    [ "${ITERATE_MODE:-0}" = "1" ] && \
+        sed -n '2,$p' "$result_tmp" 2>/dev/null | grep -v '^#' | awk -F, 'NF>=7 && $1!="" {print $1}' > "${RESULT_DIR}/iterate_pass_${NODE_TEST_NODE}"
 
     echo "# Speed test time: $(date +'%Y-%m-%d %H:%M:%S')" >> "$result_tmp"
     rotate_result_files

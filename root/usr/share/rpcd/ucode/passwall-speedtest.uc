@@ -117,9 +117,9 @@ function start() {
 }
 
 function stop() {
-	// 协作式停止：写公共停止标志 .nt_stop，各 worker 跑完当前 IP 自行 break，
-	// 主进程照常进入合并段按已有结果排序、写回最优 IP，并经 node_test_cleanup 还原 TCP 节点。
-	command('touch /tmp/passwall-speedtest/.nt_stop 2>/dev/null');
+	// 协作式停止：写公共停止标志 .nt_stop，各 worker 跑完当前 IP 自行 break；
+	// 另写 .iter_stop（脚本内无人删除），限时迭代模式据此在轮间不再开新轮。
+	command('touch /tmp/passwall-speedtest/.nt_stop /tmp/passwall-speedtest/.iter_stop 2>/dev/null');
 	// 兜底：给协作收尾足够时间（当前 IP 探测约 timeout×probes，默认 ~15s + 合并）；
 	// 仍未退出（卡在下载等非 worker 阶段或真挂死）则 SIGINT 触发 trap 清理还原，再 kill -9。
 	command('( sleep 20; pgrep -f "[p]asswall-speedtest\\.sh" | xargs kill -INT >/dev/null 2>&1; sleep 3; pgrep -f "[p]asswall-speedtest\\.sh" | xargs kill -9 >/dev/null 2>&1 ) >/dev/null 2>&1 &');

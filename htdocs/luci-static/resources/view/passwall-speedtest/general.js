@@ -430,6 +430,26 @@ return view.extend({
 		o.default = '5';
 		o.rmempty = false;
 
+		o = s.taboption('basic', form.Flag, 'iterate_enabled', _('Time-boxed iterative test'),
+			_('Run the speed test repeatedly until the configured duration elapses. From the second round on, each tested node only re-tests the IPs that passed on its own link in the previous round (tests are independent per node), so the candidate pool shrinks round by round and converges on the most stable low-latency IPs. Each round is a full run: per-node best IPs are written back and result.csv / the history chart are updated per round.'));
+		o.default = o.disabled;
+		o.rmempty = false;
+
+		o = s.taboption('basic', form.Value, 'iterate_minutes', _('Iterative test duration (minutes)'),
+			_('Total wall-clock budget for the iterative test. The run stops after the round that is in progress when the deadline passes.'));
+		o.datatype = 'uinteger';
+		o.depends('iterate_enabled', '1');
+		o.default = '30';
+		o.rmempty = false;
+		o.validate = function(sectionId, value) {
+			const enabled = this.section.formvalue(sectionId, 'iterate_enabled');
+
+			if (enabled == '1' && (!value || parseInt(value, 10) < 1))
+				return _('Duration must be at least 1 minute when the iterative test is enabled');
+
+			return true;
+		};
+
 		s.tab('cron', _('Crontab Settings'));
 
 		o = s.taboption('cron', form.Flag, 'enabled', _('Enabled'),
