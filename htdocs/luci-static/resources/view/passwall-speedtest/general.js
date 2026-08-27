@@ -431,7 +431,7 @@ return view.extend({
 		o.rmempty = false;
 
 		o = s.taboption('basic', form.Flag, 'iterate_enabled', _('Time-boxed iterative test'),
-			_('Run the speed test repeatedly until the configured duration elapses. From the second round on, each tested node only re-tests the IPs that passed on its own link in the previous round (tests are independent per node), so the candidate pool shrinks round by round and converges on the most stable low-latency IPs. Each round is a full run: per-node best IPs are written back and result.csv / the history chart are updated per round.'));
+			_('Run the test in time-boxed mode: each tested node runs its own independent loop until the duration elapses. After its first pass, a node only re-tests the IPs that passed its previous pass, so its candidate pool shrinks toward the most stable, lowest-latency IPs. Nothing is written to result.csv or passwall during the run; when the timer ends, each node\'s best remaining IP is written back.'));
 		o.default = o.disabled;
 		o.rmempty = false;
 

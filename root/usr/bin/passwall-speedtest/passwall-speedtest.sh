@@ -293,46 +293,21 @@ function speed_test(){
 }
 
 # ── 时间盒迭代测速 ──────────────────────────────────────────
-# 反复调用 node_speed_test，直到累计时长达到 iterate_minutes 分钟。
-# 各待测节点彼此独立：每轮合并阶段按节点把各自通过 IP 提取到
-# RESULT_DIR/iterate_pass_<节点>，下一轮 get_worker_ips 对每个待测节点只保留
-# 其自己上轮通过的 IP（∩ 其候选源），各节点候选池独立逐轮收敛。
-# 每轮都是完整测速：各节点写回各自最优 IP、result.csv 滚动落盘，日志/历史逐轮可见。
-# 停止：UI「停止」写 .iter_stop（配合 .nt_stop 结束当前轮），轮间检测到即不再开新轮。
+# 计时模式：不与普通模式共用「全局第 N 轮」编排——每个待测节点是一个独立收敛循环
+# （见 node_iterate_worker）：第 1 遍测自己的初始候选，此后每遍只保留通过 IP 作为
+# 下一遍候选，逐遍收敛出「最稳定基础上延迟最低」的集合，直到 NT_ITER_DEADLINE。
+# 整个运行期间各节点中途不写 result.csv、不写回 passwall；计时结束（或 UI 停止）
+# 后由 node_speed_test 的合并段一次性取各节点剩余通过集中的最优写回。
 function iterate_speed_test(){
     ITERATE_MODE=1
-    rm -f "${RESULT_DIR}/.iter_stop" "${RESULT_DIR}"/iterate_pass_* 2>/dev/null
-    local deadline=$(( $(date +%s) + iterate_minutes * 60 ))
+    rm -f "${RESULT_DIR}/.iter_stop" "${RESULT_DIR}"/iterate_cand_* 2>/dev/null
+    NT_ITER_DEADLINE=$(( $(date +%s) + iterate_minutes * 60 ))
     local started=$(date +%s)
-    local round=0 remain kept
-    while :; do
-        remain=$(( deadline - $(date +%s) ))
-        [ "$remain" -le 0 ] && break
-        if [ -f "${RESULT_DIR}/.iter_stop" ]; then
-            echolog "收到停止信号，迭代测速在第 $((round + 1)) 轮前结束（共完成 ${round} 轮）"
-            break
-        fi
-        round=$((round + 1))
-        if [ "$round" -gt 1 ]; then
-            # 候选列表本轮已就绪，跳过重复下载/重建（文件型来源本身无下载）
-            ITERATE_REUSE_LISTS=1
-            kept=$(cat "${RESULT_DIR}"/iterate_pass_* 2>/dev/null | grep -c . || true)
-            echolog "════ 迭代测速第 ${round} 轮（剩余 ${remain}s，各待测节点只测上轮各自通过的 IP，共 ${kept} 个）════"
-        else
-            echolog "════ 迭代测速第 1 轮（时长上限 ${iterate_minutes} 分钟）════"
-        fi
-        if ! node_speed_test; then
-            if [ "$round" -eq 1 ]; then
-                echolog "第 ${round} 轮测速失败，迭代测速中止"
-                return 1
-            fi
-            echolog "第 ${round} 轮测速失败（无有效结果），保留上轮各自通过列表，剩余时间内继续"
-            continue
-        fi
-        echolog "第 ${round} 轮完成"
-    done
-    echolog "迭代测速结束：共 ${round} 轮，累计 $(( $(date +%s) - started ))s"
-    return 0
+    echolog "════ 限时迭代测速开始（时长上限 ${iterate_minutes} 分钟，各待测节点独立收敛）════"
+    node_speed_test
+    local rc=$?
+    echolog "════ 迭代测速结束（累计 $(( $(date +%s) - started ))s，各节点已写回其最终最优 IP）════"
+    return $rc
 }
 
 # ── 走节点测速 ──────────────────────────────────────────────
@@ -389,8 +364,8 @@ node_test_cleanup() {
         nt_rollback
     fi
     rm -f "${NT_SNAP_FILE}" "${NT_ORIG_FILE}" 2>/dev/null
-    # 清理首完成即停用的完成标记与停止标志（覆盖单节点 inline 路径与中断退出残留）
-    rm -f "${RESULT_DIR}"/result.csv.tmp.*.done "${RESULT_DIR}"/result.csv.tmp.*.end "${RESULT_DIR}/.nt_stop" 2>/dev/null
+    # 清理首完成即停用的完成标记、迭代轮次临时结果与停止标志（含中断退出残留）
+    rm -f "${RESULT_DIR}"/result.csv.tmp.*.done "${RESULT_DIR}"/result.csv.tmp.*.end "${RESULT_DIR}"/result.csv.tmp.*.pass "${RESULT_DIR}/.nt_stop" 2>/dev/null
 }
 
 nt_lock_acquire() { while ! mkdir "${NT_LOCKDIR}" 2>/dev/null; do sleep 0.1; done; }
@@ -443,8 +418,86 @@ nt_scan_running() {
     [ "$_stop" = "1" ]
 }
 
-# 单个 worker：通过节点 $2 的链路测全部候选 IP（$5），保留行写入结果文件 $4。
-# ash 子 shell 里 local 可用（已验证）。uci set+commit 经锁串行化；run_socks+探测在锁外并行。
+# 对单个候选 IP 经节点 $_W 探测一次（uci 改 address → run_socks → probes 次 curl → 清理）。
+# 供普通 worker 与迭代 worker 共用。uci set+commit 经锁串行化；run_socks+探测在锁外并行。
+# stdout 输出一行: "keep sent recv loss avg"（keep=1 保留/0 丢弃）；日志不走 stdout。
+# 参数: $1=node $2=ip $3=probe_url $4=timeout $5=probes $6=socks_port $7=flag
+nt_probe_one_ip() {
+    local _W=$1 _ip=$2 _purl=$3 _tmo=$4 _probes=$5 _port=$6 _flag=$7
+    # uci set+commit 加锁（防多 worker 并发改 staging 丢更新）
+    nt_lock_acquire
+    uci set passwall.${_W}.address="${_ip}"
+    uci commit passwall
+    nt_lock_release
+    # 拉本地 SOCKS
+    NO_REC_PROCESS=1 /usr/share/passwall/app.sh run_socks \
+        flag="${_flag}" node=${_W} \
+        bind=127.0.0.1 socks_port=${_port} \
+        config_file=${_flag}.json >>$LOG_FILE 2>&1
+    # 就绪轮询 + 多探测（任一次非成功即 fail=1 并跳出，该 IP 整体丢弃）
+    local _sent=0 _recv=0 _lat="" _done=0 _notready=0 _fail=0
+    while [ $_done -lt $_probes ]; do
+        local _res _code _tpre _rc
+        _res=$(curl -x socks5h://127.0.0.1:${_port} -I -skL \
+            --connect-timeout 3 --max-time ${_tmo} \
+            -o /dev/null -w "%{http_code}:%{time_pretransfer}" "${_purl}" 2>/dev/null)
+        _rc=$?
+        if [ $_rc -eq 7 ]; then
+            _notready=$((_notready + 1))
+            [ $_notready -ge 10 ] && break
+            sleep 0.3
+            continue
+        fi
+        _notready=0
+        _sent=$((_sent + 1))
+        _done=$((_done + 1))
+        _code="${_res%%:*}"
+        _tpre="${_res##*:}"
+        case "$_code" in
+            200|204|301|302|307|308|40[0-9])
+                _recv=$((_recv + 1))
+                _lat="${_lat} ${_tpre}"
+                ;;
+            *)
+                _fail=1
+                break
+                ;;
+        esac
+    done
+    # 清理本次 SOCKS
+    local _pf
+    for _pf in /tmp/etc/passwall/*"${_flag}"*_plugin.pid; do
+        [ -s "$_pf" ] && kill -9 "$(head -n1 "$_pf")" >/dev/null 2>&1
+    done
+    busybox pgrep -af "${_flag}" 2>/dev/null | awk '! /passwall-speedtest\.sh/{print $1}' | xargs kill -9 >/dev/null 2>&1
+    rm -rf /tmp/etc/passwall/*"${_flag}"* 2>/dev/null
+    # 均值/丢包
+    local _avg=0 _loss="1.00"
+    if [ $_recv -gt 0 ]; then
+        _loss=$(awk -v s=$_sent -v r=$_recv 'BEGIN{printf "%.2f", (s-r)/s}')
+        _avg=$(echo "$_lat" | tr ' ' '\n' | grep -E '^[0-9.]+$' | awk '{s+=$1; n++} END{ if(n>0) printf "%.2f", s/n*1000 }')
+        [ -z "$_avg" ] && _avg=0
+    fi
+    # 过滤：任一次失败/未完成即丢；否则按 tl/tll/tlr
+    local _keep=1
+    if [ $_fail -eq 1 ] || [ $_recv -lt $_probes ]; then
+        _keep=0
+    else
+        if [ -n "${tl:-}" ] && [ "${tl}" -gt 0 ] 2>/dev/null; then
+            [ "$(awk -v v=$_avg -v c=$tl 'BEGIN{print (v>c)?1:0}')" = "1" ] && _keep=0
+        fi
+        if [ -n "${tll:-}" ] && [ "${tll}" -gt 0 ] 2>/dev/null; then
+            [ "$(awk -v v=$_avg -v c=$tll 'BEGIN{print (v<c)?1:0}')" = "1" ] && _keep=0
+        fi
+        if [ -n "${tlr:-}" ]; then
+            [ "$(awk -v v=$_loss -v c=$tlr 'BEGIN{print (v>c)?1:0}')" = "1" ] && _keep=0
+        fi
+    fi
+    echo "${_keep} ${_sent} ${_recv} ${_loss} ${_avg}"
+}
+
+# 普通 worker（非迭代模式）：通过节点 $2 的链路测全部候选 IP（$5），保留行写入结果文件 $4。
+# ash 子 shell 里 local 可用（已验证）。
 # 参数: $1=idx $2=node $3=origaddr $4=result_file $5=ip_list $6=probe_url $7=timeout $8=probes $9=socks_port $10=flag
 node_test_worker() {
     local _idx=$1 _W=$2 _orig=$3 _rfile=$4 _ips=$5 _purl=$6 _tmo=$7 _probes=$8 _port=$9 _flag=${10}
@@ -456,85 +509,86 @@ node_test_worker() {
         # 协作式提前停止：主循环首个有效结果完成后写 .nt_stop，本 worker 跑完当前 IP 即停
         [ -f "${RESULT_DIR}/.nt_stop" ] && { echolog "worker [${_W}] 收到停止信号，跑完当前 IP 即停（已完成 ${_idx2}/${_total}）"; break; }
         _idx2=$((_idx2 + 1))
-        # uci set+commit 加锁（防多 worker 并发改 staging 丢更新）
-        nt_lock_acquire
-        uci set passwall.${_W}.address="${_ip}"
-        uci commit passwall
-        nt_lock_release
-        # 拉本地 SOCKS
-        NO_REC_PROCESS=1 /usr/share/passwall/app.sh run_socks \
-            flag="${_flag}" node=${_W} \
-            bind=127.0.0.1 socks_port=${_port} \
-            config_file=${_flag}.json >>$LOG_FILE 2>&1
-        # 就绪轮询 + 多探测（任一次非成功即 fail=1 并跳出，该 IP 整体丢弃）
-        local _sent=0 _recv=0 _lat="" _done=0 _notready=0 _fail=0
-        while [ $_done -lt $_probes ]; do
-            local _res _code _tpre _rc
-            _res=$(curl -x socks5h://127.0.0.1:${_port} -I -skL \
-                --connect-timeout 3 --max-time ${_tmo} \
-                -o /dev/null -w "%{http_code}:%{time_pretransfer}" "${_purl}" 2>/dev/null)
-            _rc=$?
-            if [ $_rc -eq 7 ]; then
-                _notready=$((_notready + 1))
-                [ $_notready -ge 10 ] && break
-                sleep 0.3
-                continue
-            fi
-            _notready=0
-            _sent=$((_sent + 1))
-            _done=$((_done + 1))
-            _code="${_res%%:*}"
-            _tpre="${_res##*:}"
-            case "$_code" in
-                200|204|301|302|307|308|40[0-9])
-                    _recv=$((_recv + 1))
-                    _lat="${_lat} ${_tpre}"
-                    ;;
-                *)
-                    _fail=1
-                    break
-                    ;;
-            esac
-        done
-        # 清理本次 SOCKS
-        local _pf
-        for _pf in /tmp/etc/passwall/*"${_flag}"*_plugin.pid; do
-            [ -s "$_pf" ] && kill -9 "$(head -n1 "$_pf")" >/dev/null 2>&1
-        done
-        busybox pgrep -af "${_flag}" 2>/dev/null | awk '! /passwall-speedtest\.sh/{print $1}' | xargs kill -9 >/dev/null 2>&1
-        rm -rf /tmp/etc/passwall/*"${_flag}"* 2>/dev/null
-        # 均值/丢包
-        local _avg=0 _loss="1.00"
-        if [ $_recv -gt 0 ]; then
-            _loss=$(awk -v s=$_sent -v r=$_recv 'BEGIN{printf "%.2f", (s-r)/s}')
-            _avg=$(echo "$_lat" | tr ' ' '\n' | grep -E '^[0-9.]+$' | awk '{s+=$1; n++} END{ if(n>0) printf "%.2f", s/n*1000 }')
-            [ -z "$_avg" ] && _avg=0
-        fi
-        # 过滤：任一次失败/未完成即丢；否则按 tl/tll/tlr
-        local _keep=1
-        if [ $_fail -eq 1 ] || [ $_recv -lt $_probes ]; then
-            _keep=0
-        else
-            if [ -n "${tl:-}" ] && [ "${tl}" -gt 0 ] 2>/dev/null; then
-                [ "$(awk -v v=$_avg -v c=$tl 'BEGIN{print (v>c)?1:0}')" = "1" ] && _keep=0
-            fi
-            if [ -n "${tll:-}" ] && [ "${tll}" -gt 0 ] 2>/dev/null; then
-                [ "$(awk -v v=$_avg -v c=$tll 'BEGIN{print (v<c)?1:0}')" = "1" ] && _keep=0
-            fi
-            if [ -n "${tlr:-}" ]; then
-                [ "$(awk -v v=$_loss -v c=$tlr 'BEGIN{print (v>c)?1:0}')" = "1" ] && _keep=0
-            fi
-        fi
-        if [ $_keep -eq 1 ]; then
+        local _out _keep _sent _recv _loss _avg
+        _out=$(nt_probe_one_ip "$_W" "$_ip" "$_purl" "$_tmo" "$_probes" "$_port" "$_flag")
+        _keep=${_out%% *}; _out=${_out#* }
+        _sent=${_out%% *}; _out=${_out#* }
+        _recv=${_out%% *}; _out=${_out#* }
+        _loss=${_out%% *}; _avg=${_out#* }
+        if [ "$_keep" = "1" ]; then
             echo "${_ip},${_sent},${_recv},${_loss},${_avg},0.00," >> "$_rfile"
         fi
         local _st
-        _st=$([ $_keep -eq 1 ] && echo "保留" || echo "丢弃")
+        _st=$([ "$_keep" = "1" ] && echo "保留" || echo "丢弃")
         echolog "进度: 走节点测速 [${_W}] ${_idx2}/${_total} ($((_idx2*100/_total))%) - ${_ip} 延迟 ${_avg}ms 丢包 ${_loss} [${_st}]"
     done
     # 本 worker 结果按延迟升序排（首行即该节点最优）
     sort_result "$_rfile" latency
     # 完成标记：有有效结果写 .done（触发首个有效结果即停），否则写 .end（仅释放并发槽）
+    if [ -n "$(first_result_ip "$_rfile")" ]; then
+        : > "${_rfile}.done"
+    else
+        : > "${_rfile}.end"
+    fi
+}
+
+# 迭代模式 worker：每个待测节点一个独立收敛循环，直到 deadline 或停止标志。
+# 候选列表存 RESULT_DIR/iterate_cand_<节点>（该节点自己的临时待测 IP 列表）：
+#   第 1 轮 = 初始候选（$4），此后每轮只保留通过 IP（按延迟升序）作为下一轮候选，
+#   逐轮收敛出「最稳定基础上延迟最低」的集合。到点后留下的就是最稳的 IP。
+# 结果文件 $3 每轮完成时原子覆盖（首行=该节点当前最优）；中途不写 result.csv、不动 passwall。
+# 任一轮通过数为 0 → 该节点无存活 IP，保留上一轮结果并退出。
+# 每 IP 之间也检查 deadline/停止标志，到点跑完当前 IP 即停，无全局轮次同步。
+# 参数: $1=idx $2=node $3=result_file $4=ip_list $5=probe_url $6=timeout $7=probes $8=socks_port $9=flag $10=deadline(epoch)
+node_iterate_worker() {
+    local _idx=$1 _W=$2 _rfile=$3 _ips=$4 _purl=$5 _tmo=$6 _probes=$7 _port=$8 _flag=$9 _deadline=${10}
+    local _cand="${RESULT_DIR}/iterate_cand_${_W}"
+    local _pass=0 _ip _list _total _passfile
+    printf '%s\n' "$_ips" | grep -vE '^[[:space:]]*#|^[[:space:]]*$' > "$_cand"
+    while :; do
+        # 到点 / 用户停止（.nt_stop 与 .iter_stop 都查）→ 跑完当前判定即退
+        [ -f "${RESULT_DIR}/.nt_stop" ] && break
+        [ -f "${RESULT_DIR}/.iter_stop" ] && break
+        [ "$(date +%s)" -ge "$_deadline" ] && break
+        _pass=$((_pass + 1))
+        _list=$(grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$_cand" 2>/dev/null)
+        [ -n "$_list" ] && [ "$(printf '%s\n' "$_list" | grep -c .)" -gt 0 ] || break
+        local _idx2=0 _total
+        _total=$(printf '%s\n' "$_list" | grep -c .)
+        _passfile="${_rfile}.pass"
+        echo "IP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码" > "$_passfile"
+        printf '%s\n' "$_list" | while read -r _ip; do
+            [ -n "$_ip" ] || continue
+            [ -f "${RESULT_DIR}/.nt_stop" ] && { echolog "迭代 [${_W}] 第 ${_pass} 轮收到停止信号，跑完当前 IP 即停"; break; }
+            [ -f "${RESULT_DIR}/.iter_stop" ] && break
+            [ "$(date +%s)" -ge "$_deadline" ] && { echolog "迭代 [${_W}] 到达时长上限，跑完当前 IP 即停"; break; }
+            _idx2=$((_idx2 + 1))
+            local _out _keep _sent _recv _loss _avg
+            _out=$(nt_probe_one_ip "$_W" "$_ip" "$_purl" "$_tmo" "$_probes" "$_port" "${_flag}_p${_pass}")
+            _keep=${_out%% *}; _out=${_out#* }
+            _sent=${_out%% *}; _out=${_out#* }
+            _recv=${_out%% *}; _out=${_out#* }
+            _loss=${_out%% *}; _avg=${_out#* }
+            [ "$_keep" = "1" ] && echo "${_ip},${_sent},${_recv},${_loss},${_avg},0.00," >> "$_passfile"
+            local _st
+            _st=$([ "$_keep" = "1" ] && echo "保留" || echo "丢弃")
+            echolog "迭代: [${_W}] 第 ${_pass} 轮 ${_idx2}/${_total} ($((_idx2*100/_total))%) - ${_ip} 延迟 ${_avg}ms 丢包 ${_loss} [${_st}]"
+        done
+        # 本轮通过集原子落盘：有数据才覆盖结果文件并收缩候选；全挂则保留上一轮结果并退出
+        if [ "$(grep -c . "$_passfile" 2>/dev/null)" -gt 1 ]; then
+            sort_result "$_passfile" latency
+            mv -f "$_passfile" "$_rfile"
+            sed -n '2,$p' "$_rfile" 2>/dev/null | grep -v '^#' | awk -F, 'NF>=7 && $1!="" {print $1}' > "${_cand}.new"
+            mv -f "${_cand}.new" "$_cand"
+            echolog "迭代 [${_W}] 第 ${_pass} 轮完成，通过 $(wc -l < "$_cand" | tr -d ' ')/${_total}"
+        else
+            rm -f "$_passfile"
+            echolog "迭代 [${_W}] 第 ${_pass} 轮全部失败，保留第 $((_pass - 1)) 轮结果，该节点提前结束"
+            break
+        fi
+        [ "$(wc -l < "$_cand" | tr -d ' ')" -eq 0 ] && break
+    done
+    # 完成标记（到点/停止后写，主进程 wait 收尸后合并）
     if [ -n "$(first_result_ip "$_rfile")" ]; then
         : > "${_rfile}.done"
     else
@@ -581,19 +635,14 @@ node_speed_test() {
     local selected_ip_file=""
     if [ "${ip_source:-}" = "online" ]; then
         # online CM 源：一次下载原始列表，按各 ip_list 的 regions 分别过滤成 ip_list_<N>.txt
-        # 迭代模式第 2 轮起跳过重复下载/重建（列表本轮内不变，文件仍在 RESULT_DIR）
-        if [ "${ITERATE_REUSE_LISTS:-0}" = "1" ]; then
-            echolog "迭代模式：复用本轮已下载的在线 CM IP 列表"
-        else
-            migrate_ip_online_regions
-            fetch_online_raw || return 1
-            compute_default_ip_list
-            local _n _e
-            for _n in 1 2 3 4 5; do
-                eval "_e=\${list${_n}_enabled:-0}"
-                [ "$_e" = "1" ] && build_ip_list_file "$_n"
-            done
-        fi
+        migrate_ip_online_regions
+        fetch_online_raw || return 1
+        compute_default_ip_list
+        local _n _e
+        for _n in 1 2 3 4 5; do
+            eval "_e=\${list${_n}_enabled:-0}"
+            [ "$_e" = "1" ] && build_ip_list_file "$_n"
+        done
         ip_source_mode="online"
     else
         selected_ip_file="$(select_ip_file)"
@@ -606,10 +655,9 @@ node_speed_test() {
     read_node_ip_map
 
     # 取某 worker 的候选 IP（grep 去注释空行 + head -n count）。无 echolog、可在 $(..) 内用。
-    # 迭代模式（ITERATE_MODE=1）时再 ∩ 该 worker 上轮通过的 IP（iterate_pass_<节点>），
-    # 只测上轮通过者；首轮无该文件 → 全量候选。
+    # 迭代模式下这只是该 worker 的「初始候选」——worker 内部的收敛循环自己维护缩小后的列表。
     get_worker_ips(){
-        local nodeid="$1" src_file="" prev_file=""
+        local nodeid="$1" src_file=""
         if [ "$ip_source_mode" = "online" ]; then
             local N
             N=$(resolve_node_list "$nodeid")
@@ -622,13 +670,6 @@ node_speed_test() {
             src_file="$selected_ip_file"
         fi
         [ -n "$src_file" ] && [ -f "$src_file" ] || return 1
-        if [ "${ITERATE_MODE:-0}" = "1" ]; then
-            prev_file="${RESULT_DIR}/iterate_pass_${nodeid}"
-            if [ -s "$prev_file" ]; then
-                grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$src_file" | grep -Fxf "$prev_file" | head -n "$count"
-                return 0
-            fi
-        fi
         grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$src_file" | head -n "$count"
     }
 
@@ -687,45 +728,67 @@ node_speed_test() {
             # 任一 worker 跑完全部候选 IP 且保留≥1 个有效 IP（写 .done）时，立即终止其余
             # worker，跳到合并阶段按已有（含被杀 worker 的部分）结果排序。无有效结果的
             # worker 完成（写 .end）仅释放并发槽，不触发停止。
-            echolog "提示：首个 worker 测出有效结果即终止其余，按已有结果排序"
             NT_RUNNING=""
             rm -f "${RESULT_DIR}/.nt_stop" 2>/dev/null
             local launched=0 _stop=0 _rfile _t _port _wips _wtot
-            [ "$threads" -ge 1 ] 2>/dev/null || threads=$widx
-            for _w in $valid_workers; do
-                [ "$_stop" = "1" ] && break
-                # 达到并发上限：轮询回收已完成 worker 释放空位，或首个有效结果触发停止
-                while [ "$(echo $NT_RUNNING | wc -w)" -ge "$threads" ] && [ "$_stop" != "1" ]; do
-                    if nt_scan_running; then _stop=1; break; fi
-                    [ "$(echo $NT_RUNNING | wc -w)" -ge "$threads" ] && sleep 0.5
+            if [ "${ITERATE_MODE:-0}" = "1" ]; then
+                # ── 限时迭代：每个待测节点一个独立收敛循环 ──
+                # 无全局轮次、无「首个有效结果即停」；各 worker 内部自维护缩小候选列表，
+                # 循环到 NT_ITER_DEADLINE（或停止标志）为止。并发上限不适用，全部同时运行。
+                # 结果只在最后合并一次写回（中途不写 result.csv、不动 passwall 结果）。
+                echolog "迭代模式：${widx} 个待测节点各跑独立收敛循环至时限，全部同时运行（并发上限不适用）"
+                for _w in $valid_workers; do
+                    launched=$((launched + 1))
+                    _rfile="${RESULT_DIR}/result.csv.tmp.$_w"
+                    rm -f "${_rfile}.done" "${_rfile}.end" "${_rfile}.pass" 2>/dev/null
+                    # 端口确定性分配：48900 + idx - 1（每 worker 固定端口，复用于其所有 IP）
+                    _port=$((48900 + launched - 1))
+                    _wips=$(get_worker_ips "$_w") || { echolog "worker 节点 $_w 候选 IP 不可用，跳过"; continue; }
+                    [ "$(echo "$_wips" | grep -c .)" -gt 0 ] || { echolog "worker 节点 $_w 候选 IP 为空，跳过"; continue; }
+                    node_iterate_worker "$launched" "$_w" "$_rfile" "$_wips" "$probe_url" "$timeout" "$probes" "$_port" "${NODE_TEST_FLAG_BASE}_$launched" "$NT_ITER_DEADLINE" &
+                    NT_RUNNING="${NT_RUNNING:+$NT_RUNNING }$!:${_w}"
                 done
-                [ "$_stop" = "1" ] && break
-                launched=$((launched + 1))
-                _rfile="${RESULT_DIR}/result.csv.tmp.$_w"
-                rm -f "${_rfile}.done" "${_rfile}.end" 2>/dev/null
-                # 端口确定性分配：48900 + idx - 1（每 worker 固定端口，复用于其所有 IP）
-                _port=$((48900 + launched - 1))
-                # 按 worker 取其对应 CM IP 列表（在线模式 per-worker；非在线模式共享 selected_ip_file）
-                _wips=$(get_worker_ips "$_w") || { echolog "worker 节点 $_w 候选 IP 不可用，跳过"; continue; }
-                _wtot=$(echo "$_wips" | grep -c .)
-                [ "$_wtot" -gt 0 ] || { echolog "worker 节点 $_w 候选 IP 为空，跳过"; continue; }
-                [ "$_wtot" -lt "$count" ] && [ "${ITERATE_MODE:-0}" != "1" ] && echolog "worker 节点 $_w 候选 IP $_wtot < $count（其 CM 列表偏小）"
-                node_test_worker "$launched" "$_w" "" "$_rfile" "$_wips" "$probe_url" "$timeout" "$probes" "$_port" "${NODE_TEST_FLAG_BASE}_$launched" &
-                NT_RUNNING="${NT_RUNNING:+$NT_RUNNING }$!:${_w}"
-            done
-            # 排空仍运行的 worker（无提前停止时正常完成路径）
-            while [ -n "$NT_RUNNING" ] && [ "$_stop" != "1" ]; do
-                if nt_scan_running; then _stop=1; break; fi
-                [ -n "$NT_RUNNING" ] && [ "$_stop" != "1" ] && sleep 0.5
-            done
-            # 提前停止：写停止标志，其余 worker 跑完当前 IP 自行 break 退出，wait 收尸（不 kill）
-            if [ "$_stop" = "1" ]; then
-                echolog "首个有效结果 worker 完成，其余 worker 跑完当前 IP 即停，按已有结果排序"
-                : > "${RESULT_DIR}/.nt_stop"
-                wait  # 各 worker 自行 break → 写 .done/.end → 正常退出，wait 收尸
+                # 各 worker 到点/停止后自行退出，wait 收尸，随后按各自最终通过集合并（仅一次）
+                wait
+            else
+                # ── 普通模式：并发上限 + 首个有效结果即停 ──
+                echolog "提示：首个 worker 测出有效结果即终止其余，按已有结果排序"
+                [ "$threads" -ge 1 ] 2>/dev/null || threads=$widx
+                for _w in $valid_workers; do
+                    [ "$_stop" = "1" ] && break
+                    # 达到并发上限：轮询回收已完成 worker 释放空位，或首个有效结果触发停止
+                    while [ "$(echo $NT_RUNNING | wc -w)" -ge "$threads" ] && [ "$_stop" != "1" ]; do
+                        if nt_scan_running; then _stop=1; break; fi
+                        [ "$(echo $NT_RUNNING | wc -w)" -ge "$threads" ] && sleep 0.5
+                    done
+                    [ "$_stop" = "1" ] && break
+                    launched=$((launched + 1))
+                    _rfile="${RESULT_DIR}/result.csv.tmp.$_w"
+                    rm -f "${_rfile}.done" "${_rfile}.end" 2>/dev/null
+                    # 端口确定性分配：48900 + idx - 1（每 worker 固定端口，复用于其所有 IP）
+                    _port=$((48900 + launched - 1))
+                    # 按 worker 取其对应 CM IP 列表（在线模式 per-worker；非在线模式共享 selected_ip_file）
+                    _wips=$(get_worker_ips "$_w") || { echolog "worker 节点 $_w 候选 IP 不可用，跳过"; continue; }
+                    _wtot=$(echo "$_wips" | grep -c .)
+                    [ "$_wtot" -gt 0 ] || { echolog "worker 节点 $_w 候选 IP 为空，跳过"; continue; }
+                    [ "$_wtot" -lt "$count" ] && echolog "worker 节点 $_w 候选 IP $_wtot < $count（其 CM 列表偏小）"
+                    node_test_worker "$launched" "$_w" "" "$_rfile" "$_wips" "$probe_url" "$timeout" "$probes" "$_port" "${NODE_TEST_FLAG_BASE}_$launched" &
+                    NT_RUNNING="${NT_RUNNING:+$NT_RUNNING }$!:${_w}"
+                done
+                # 排空仍运行的 worker（无提前停止时正常完成路径）
+                while [ -n "$NT_RUNNING" ] && [ "$_stop" != "1" ]; do
+                    if nt_scan_running; then _stop=1; break; fi
+                    [ -n "$NT_RUNNING" ] && [ "$_stop" != "1" ] && sleep 0.5
+                done
+                # 提前停止：写停止标志，其余 worker 跑完当前 IP 自行 break 退出，wait 收尸（不 kill）
+                if [ "$_stop" = "1" ]; then
+                    echolog "首个有效结果 worker 完成，其余 worker 跑完当前 IP 即停，按已有结果排序"
+                    : > "${RESULT_DIR}/.nt_stop"
+                    wait  # 各 worker 自行 break → 写 .done/.end → 正常退出，wait 收尸
+                fi
             fi
             NT_RUNNING=""
-            rm -f "${RESULT_DIR}"/result.csv.tmp.*.done "${RESULT_DIR}"/result.csv.tmp.*.end "${RESULT_DIR}/.nt_stop" 2>/dev/null
+            rm -f "${RESULT_DIR}"/result.csv.tmp.*.done "${RESULT_DIR}"/result.csv.tmp.*.end "${RESULT_DIR}"/result.csv.tmp.*.pass "${RESULT_DIR}/.nt_stop" 2>/dev/null
             # 各 worker 写回各自最优（串行，单进程无锁）
             local merged reapply
             merged="$(mktemp "${RESULT_DIR}/result.csv.merged.XXXXXX")"
@@ -747,9 +810,6 @@ node_speed_test() {
                 fi
                 # awk 过滤丢掉被杀 worker kill -9 中途截断的脏行（NF<7），正常 7 列行等价
                 sed '1d' "$mwfile" 2>/dev/null | awk -F, 'NF>=7 && $1!=""' >> "$merged"
-                # 迭代模式：提取该 worker 本轮通过 IP，供下一轮 get_worker_ips 独立过滤
-                [ "${ITERATE_MODE:-0}" = "1" ] && \
-                    sed -n '2,$p' "$mwfile" 2>/dev/null | grep -v '^#' | awk -F, 'NF>=7 && $1!="" {print $1}' > "${RESULT_DIR}/iterate_pass_${mw}"
                 rm -f "$mwfile"
             done < "$NT_ORIG_FILE"
             rm -f "${NT_ORIG_FILE}"; NT_ORIG_FILE=""
@@ -814,7 +874,7 @@ node_speed_test() {
     ip_list=$(get_worker_ips "${NODE_TEST_NODE}") || { echolog "passwall 节点 ${NODE_TEST_NODE} 候选 IP 不可用"; return 1; }
     total=$(echo "$ip_list" | grep -c .)
     [ "$total" -gt 0 ] || { echolog "passwall 节点 ${NODE_TEST_NODE} 候选 IP 列表为空"; return 1; }
-    [ "$total" -lt "$count" ] && [ "${ITERATE_MODE:-0}" != "1" ] && echolog "节点 ${NODE_TEST_NODE} 候选 IP $total < $count（其 CM 列表偏小）"
+    [ "$total" -lt "$count" ] && echolog "节点 ${NODE_TEST_NODE} 候选 IP $total < $count（其 CM 列表偏小）"
     NODE_TESTED_WORKERS="${NODE_TEST_NODE}"
 
     echolog "开始走节点测速（单节点串行: ${NODE_TEST_NODE}, 候选: ${total}, 每IP探测 ${probes} 次, 超时 ${timeout}s）"
@@ -824,7 +884,13 @@ node_speed_test() {
     # inline 调用 worker 之前切 passwall TCP 节点到稳定节点（测后由 node_test_cleanup 还原）
     nt_switch_tcp_node || { echolog "稳定节点非法，中止"; node_test_cleanup; trap - EXIT INT TERM; return 1; }
     # 单节点：inline 调用 worker（不 background），端口 48900、flag=base
-    node_test_worker 1 "${NODE_TEST_NODE}" "${NODE_TEST_ORIG_ADDR}" "$result_tmp" "$ip_list" "$probe_url" "$timeout" "$probes" 48900 "${NODE_TEST_FLAG_BASE}"
+    if [ "${ITERATE_MODE:-0}" = "1" ]; then
+        # 限时迭代：该节点跑独立收敛循环到时限，结果文件同路径，末尾统一合并写回（仅一次）
+        echolog "迭代模式：节点 ${NODE_TEST_NODE} 独立收敛循环至时限（${NT_ITER_DEADLINE} 截止）"
+        node_iterate_worker 1 "${NODE_TEST_NODE}" "$result_tmp" "$ip_list" "$probe_url" "$timeout" "$probes" 48900 "${NODE_TEST_FLAG_BASE}" "$NT_ITER_DEADLINE"
+    else
+        node_test_worker 1 "${NODE_TEST_NODE}" "${NODE_TEST_ORIG_ADDR}" "$result_tmp" "$ip_list" "$probe_url" "$timeout" "$probes" 48900 "${NODE_TEST_FLAG_BASE}"
+    fi
 
     if [ -z "$(first_result_ip "$result_tmp")" ]; then
         echolog "走节点测速结果 IP 数量为 0，整份回滚并保留上一次结果"
@@ -832,10 +898,6 @@ node_speed_test() {
         node_test_cleanup; trap - EXIT INT TERM
         return 1
     fi
-
-    # 迭代模式：提取本节点本轮通过 IP，供下一轮 get_worker_ips 独立过滤
-    [ "${ITERATE_MODE:-0}" = "1" ] && \
-        sed -n '2,$p' "$result_tmp" 2>/dev/null | grep -v '^#' | awk -F, 'NF>=7 && $1!="" {print $1}' > "${RESULT_DIR}/iterate_pass_${NODE_TEST_NODE}"
 
     echo "# Speed test time: $(date +'%Y-%m-%d %H:%M:%S')" >> "$result_tmp"
     rotate_result_files

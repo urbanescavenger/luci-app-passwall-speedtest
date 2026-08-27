@@ -20,7 +20,7 @@
 *   **Node-Based Latency Test**: Probes candidate Cloudflare IPs through your passwall node chain — finds the best CF IP *as seen from your proxy's egress*.
 *   **Multi-Threaded Workers**: Passwall nodes selected in the Third-Party tab run as parallel workers — each tests all candidate IPs through its own chain and gets its own best IP written back. Concurrency is capped by `node_test_threads`.
 *   **Fail-Fast Multi-Probe**: Each IP is probed `node_test_probes` times; if any probe fails, the IP is discarded immediately. Only IPs that succeed on all probes are kept, so the result is a stable one.
-*   **Time-Boxed Iterative Test**: With `iterate_enabled`, the full test runs repeatedly until `iterate_minutes` elapses; from the second round on, each tested node only re-tests the IPs that passed on its own link in the previous round (tests are independent per node), so the candidate pool shrinks round by round and converges on the most stable low-latency IPs.
+*   **Time-Boxed Iterative Test**: With `iterate_enabled`, each tested node runs its **own independent convergence loop** until `iterate_minutes` elapses: after its first pass it only re-tests the IPs that passed its previous pass, so its candidate pool shrinks toward the most stable, lowest-latency IPs. Nothing is written to result.csv or passwall mid-run; when the timer ends, each node's best remaining IP is written back in one final merge.
 *   **Proxy Integration**: Writes the best IP back to ssr / passwall / passwall2 / bypass / vssr nodes, and to HOST / MosDNS / astra-dns / Alibaba Cloud DDNS.
 *   **Visual Charts**: History chart for latency trends (download-speed chart removed — node mode is latency-only).
 *   **Improved UI & Logs**: Redesigned status display; per-IP log lines like `进度: 走节点测速 [node] 5/30 (16%) - 1.2.3.4 延迟 87ms 丢包 0.00 [保留]`.
@@ -45,7 +45,7 @@ Three pages under LuCI → Services → PassWall Speed Test:
 *   **Probe timeout**: Per-IP curl `--max-time` (seconds).
 *   **Probes per IP**: Number of curl probes per IP (all must succeed or the IP is discarded).
 *   **Max parallel workers**: Concurrency cap for multi-node mode (0 = all).
-*   **Time-boxed iterative test / duration**: Repeat the test until the configured duration elapses; from round 2 on, each tested node only re-tests IPs that passed on its own link in the previous round.
+*   **Time-boxed iterative test / duration**: Time-boxed mode where each tested node runs an independent convergence loop (each pass only re-tests IPs that passed the previous pass); at the deadline the best remaining IP per node is written back.
 
 ## How the Best IP Is Applied
 
