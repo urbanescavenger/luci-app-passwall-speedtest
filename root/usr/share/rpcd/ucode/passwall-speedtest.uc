@@ -130,9 +130,11 @@ function stop() {
 function get_log(req) {
 	let chunk = read_file_chunk(LOG_FILE, req.args.pos);
 
+	// 原样返回整行（含 [节点] / [保留] 等方括号段）——此前把 [..] 替换成换行
+	// 会把节点 ID 和保留/丢弃标签从日志页吞掉，无法按节点核对轮次。
 	return {
 		pos: chunk.pos,
-		content: replace(chunk.content, /\[[^\]]*\]/g, '\n')
+		content: chunk.content
 	};
 }
 

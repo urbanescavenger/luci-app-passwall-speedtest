@@ -1,6 +1,7 @@
 #!/bin/sh
 
 LOG_FILE='/tmp/passwall-speedtest.log'
+PERSIST_LOG='/etc/config/passwall-speedtest.log'
 RESULT_DIR='/tmp/passwall-speedtest'
 IP_FILE="$RESULT_DIR/result.csv"
 IPV4_TXT='/usr/share/passwall-speedtest/ip.txt'
@@ -112,6 +113,18 @@ function resolve_node_list(){
         [ "$_e" = "1" ] && { echo "$_v"; return 0; }
     fi
     echo "$DEFAULT_IP_LIST"
+}
+
+# 滚动归档上一次运行的日志，最多保留 5 份（/tmp 内存盘，重启即清，不写 flash）。
+# .log.1 = 上一次运行，.log.5 = 最旧；本次运行写 .log 本体。SSH 查看：cat /tmp/passwall-speedtest.log.1
+function rotate_log_files(){
+    local i
+    [ -f "$LOG_FILE" ] || return 0
+    rm -f "${LOG_FILE}.5"
+    for i in 4 3 2 1; do
+        [ -f "${LOG_FILE}.$i" ] && mv -f "${LOG_FILE}.$i" "${LOG_FILE}.$((i+1))"
+    done
+    mv -f "$LOG_FILE" "${LOG_FILE}.1"
 }
 
 function rotate_result_files(){
@@ -277,19 +290,24 @@ function select_ip_file(){
 }
 
 function speed_test(){
-    # 日志只在整次测速入口清一次（迭代模式下每轮都清会把进度日志抹掉）
-    rm -rf $LOG_FILE
+    # 日志只在整次测速入口处理一次：上次运行日志滚动归档为 .log.1~.log.5
+    rotate_log_files
     # 走节点测速：把候选 CF IP 写进 passwall 节点 address，用 passwall app.sh run_socks
     # 拉本地 SOCKS，curl -I 取 time_pretransfer 测延迟，多 worker 并行、多 probe fail-fast。
     # 结果写回各 passwall worker 节点。
+    local _rc=0
     if [ "${iterate_enabled:-0}" = "1" ]; then
         case "${iterate_minutes:-}" in ''|*[!0-9]*) echolog "迭代测速时长无效，中止"; return 1 ;; esac
         [ "${iterate_minutes}" -ge 1 ] 2>/dev/null || { echolog "迭代测速时长须 ≥1 分钟，中止"; return 1; }
         iterate_speed_test
-        return $?
+        _rc=$?
+    else
+        node_speed_test
+        _rc=$?
     fi
-    node_speed_test
-    return $?
+    # 持久日志：本次运行结束（无论成败）把 /tmp 日志覆盖到配置同目录，重启不丢
+    cp -f "$LOG_FILE" "$PERSIST_LOG" 2>/dev/null
+    return $_rc
 }
 
 # ── 时间盒迭代测速 ──────────────────────────────────────────
@@ -502,12 +520,15 @@ nt_probe_one_ip() {
 node_test_worker() {
     local _idx=$1 _W=$2 _orig=$3 _rfile=$4 _ips=$5 _purl=$6 _tmo=$7 _probes=$8 _port=$9 _flag=${10}
     local _ip _idx2=0 _total
+    # 日志用节点备注名（无 remarks 则回退节点 id）；uci -q get 直读配置，子 shell 可用
+    local _Wn
+    _Wn="$(uci -q get "passwall.${_W}.remarks" 2>/dev/null)"; _Wn="${_Wn:-${_W}}"
     _total=$(printf '%s\n' "$_ips" | grep -c .)
     echo "IP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码" > "$_rfile"
     printf '%s\n' "$_ips" | while read -r _ip; do
         [ -n "$_ip" ] || continue
         # 协作式提前停止：主循环首个有效结果完成后写 .nt_stop，本 worker 跑完当前 IP 即停
-        [ -f "${RESULT_DIR}/.nt_stop" ] && { echolog "worker [${_W}] 收到停止信号，跑完当前 IP 即停（已完成 ${_idx2}/${_total}）"; break; }
+        [ -f "${RESULT_DIR}/.nt_stop" ] && { echolog "worker [${_Wn}] 收到停止信号，跑完当前 IP 即停（已完成 ${_idx2}/${_total}）"; break; }
         _idx2=$((_idx2 + 1))
         local _out _keep _sent _recv _loss _avg
         _out=$(nt_probe_one_ip "$_W" "$_ip" "$_purl" "$_tmo" "$_probes" "$_port" "$_flag")
@@ -520,7 +541,7 @@ node_test_worker() {
         fi
         local _st
         _st=$([ "$_keep" = "1" ] && echo "保留" || echo "丢弃")
-        echolog "进度: 走节点测速 [${_W}] ${_idx2}/${_total} ($((_idx2*100/_total))%) - ${_ip} 延迟 ${_avg}ms 丢包 ${_loss} [${_st}]"
+        echolog "进度: 走节点测速 [${_Wn}] ${_idx2}/${_total} ($((_idx2*100/_total))%) - ${_ip} 延迟 ${_avg}ms 丢包 ${_loss} [${_st}]"
     done
     # 本 worker 结果按延迟升序排（首行即该节点最优）
     sort_result "$_rfile" latency
@@ -544,6 +565,9 @@ node_iterate_worker() {
     local _idx=$1 _W=$2 _rfile=$3 _ips=$4 _purl=$5 _tmo=$6 _probes=$7 _port=$8 _flag=$9 _deadline=${10}
     local _cand="${RESULT_DIR}/iterate_cand_${_W}"
     local _pass=0 _ip _list _total _passfile
+    # 日志用节点备注名（无 remarks 则回退节点 id）；uci -q get 直读配置，子 shell 可用
+    local _Wn
+    _Wn="$(uci -q get "passwall.${_W}.remarks" 2>/dev/null)"; _Wn="${_Wn:-${_W}}"
     printf '%s\n' "$_ips" | grep -vE '^[[:space:]]*#|^[[:space:]]*$' > "$_cand"
     while :; do
         # 到点 / 用户停止（.nt_stop 与 .iter_stop 都查）→ 跑完当前判定即退
@@ -559,9 +583,9 @@ node_iterate_worker() {
         echo "IP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码" > "$_passfile"
         printf '%s\n' "$_list" | while read -r _ip; do
             [ -n "$_ip" ] || continue
-            [ -f "${RESULT_DIR}/.nt_stop" ] && { echolog "迭代 [${_W}] 第 ${_pass} 轮收到停止信号，跑完当前 IP 即停"; break; }
+            [ -f "${RESULT_DIR}/.nt_stop" ] && { echolog "迭代 [${_Wn}] 第 ${_pass} 轮收到停止信号，跑完当前 IP 即停"; break; }
             [ -f "${RESULT_DIR}/.iter_stop" ] && break
-            [ "$(date +%s)" -ge "$_deadline" ] && { echolog "迭代 [${_W}] 到达时长上限，跑完当前 IP 即停"; break; }
+            [ "$(date +%s)" -ge "$_deadline" ] && { echolog "迭代 [${_Wn}] 到达时长上限，跑完当前 IP 即停"; break; }
             _idx2=$((_idx2 + 1))
             local _out _keep _sent _recv _loss _avg
             _out=$(nt_probe_one_ip "$_W" "$_ip" "$_purl" "$_tmo" "$_probes" "$_port" "${_flag}_p${_pass}")
@@ -572,7 +596,7 @@ node_iterate_worker() {
             [ "$_keep" = "1" ] && echo "${_ip},${_sent},${_recv},${_loss},${_avg},0.00," >> "$_passfile"
             local _st
             _st=$([ "$_keep" = "1" ] && echo "保留" || echo "丢弃")
-            echolog "迭代: [${_W}] 第 ${_pass} 轮 ${_idx2}/${_total} ($((_idx2*100/_total))%) - ${_ip} 延迟 ${_avg}ms 丢包 ${_loss} [${_st}]"
+            echolog "迭代: [${_Wn}] 第 ${_pass} 轮 ${_idx2}/${_total} ($((_idx2*100/_total))%) - ${_ip} 延迟 ${_avg}ms 丢包 ${_loss} [${_st}]"
         done
         # 本轮通过集原子落盘：有数据才覆盖结果文件并收缩候选；全挂则保留上一轮结果并退出
         if [ "$(grep -c . "$_passfile" 2>/dev/null)" -gt 1 ]; then
@@ -580,10 +604,10 @@ node_iterate_worker() {
             mv -f "$_passfile" "$_rfile"
             sed -n '2,$p' "$_rfile" 2>/dev/null | grep -v '^#' | awk -F, 'NF>=7 && $1!="" {print $1}' > "${_cand}.new"
             mv -f "${_cand}.new" "$_cand"
-            echolog "迭代 [${_W}] 第 ${_pass} 轮完成，通过 $(wc -l < "$_cand" | tr -d ' ')/${_total}"
+            echolog "迭代 [${_Wn}] 第 ${_pass} 轮完成，通过 $(wc -l < "$_cand" | tr -d ' ')/${_total}"
         else
             rm -f "$_passfile"
-            echolog "迭代 [${_W}] 第 ${_pass} 轮全部失败，保留第 $((_pass - 1)) 轮结果，该节点提前结束"
+            echolog "迭代 [${_Wn}] 第 ${_pass} 轮全部失败，保留第 $((_pass - 1)) 轮结果，该节点提前结束"
             break
         fi
         [ "$(wc -l < "$_cand" | tr -d ' ')" -eq 0 ] && break
@@ -802,11 +826,13 @@ node_speed_test() {
                 # 取到该 worker 最低延迟 IP 写回 passwall address。对已完成 worker 幂等。
                 sort_result "$mwfile" latency
                 mwbest=$(first_result_ip "$mwfile")
+                local mwname
+                mwname="$(uci -q get "passwall.${mw}.remarks" 2>/dev/null)"; mwname="${mwname:-$mw}"
                 if [ -n "$mwbest" ]; then
                     printf '%s\t%s\n' "$mw" "$mwbest" >> "$reapply"
-                    echolog "走节点测速完成 [${mw}]，最优 IP ${mwbest} 待写回 passwall 节点"
+                    echolog "走节点测速完成 [${mwname}]，最优 IP ${mwbest} 待写回 passwall 节点"
                 else
-                    echolog "走节点测速 [${mw}] 结果为空，保留原 address"
+                    echolog "走节点测速 [${mwname}] 结果为空，保留原 address"
                 fi
                 # awk 过滤丢掉被杀 worker kill -9 中途截断的脏行（NF<7），正常 7 列行等价
                 sed '1d' "$mwfile" 2>/dev/null | awk -F, 'NF>=7 && $1!=""' >> "$merged"

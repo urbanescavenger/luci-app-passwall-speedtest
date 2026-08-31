@@ -64,6 +64,8 @@ Built-in cron scheduling supports a 1–24 hour interval or a custom cron expres
 
 Results are saved to `/tmp/passwall-speedtest/result.csv` with 10 rolling historical versions kept; the Best IP area shows the last 100 lines, and the latency chart plots the most recent 10 results.
 
+Run logs are kept at `/tmp/passwall-speedtest.log`; at the start of each run the previous log is rotated to `.log.1` ~ `.log.5` (last 5 runs; `/tmp` is a RAM disk — cleared on reboot, never written to flash). In addition, when each run finishes its full log is **overwritten** to `/etc/config/passwall-speedtest.log` (same directory as the UCI config — persistent across reboots, keeps only the most recent run). The log page shows whole lines including `[node remark]` and `[kept]/[dropped]` tags, so per-node iteration rounds can be read directly.
+
 ## Installation
 
 1.  Download the latest `.ipk` or `.apk` file from [Releases](https://github.com/urbanescavenger/luci-app-passwall-speedtest/releases).

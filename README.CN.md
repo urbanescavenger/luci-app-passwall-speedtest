@@ -64,6 +64,8 @@
 
 测速结果保存在 `/tmp/passwall-speedtest/result.csv`，滚动保留 10 个历史版本；Best IP 区显示最近 100 行，延迟图表取最近 10 次结果绘制。
 
+运行日志保存在 `/tmp/passwall-speedtest.log`，每次运行开始时把上次日志滚动归档为 `.log.1` ~ `.log.5`（最近 5 次，`/tmp` 内存盘重启即清、不写 flash）。此外每次运行结束时把本次完整日志**覆盖**到 `/etc/config/passwall-speedtest.log`（与 UCI 配置文件同目录，持久保存、重启不丢，只保留最近一次运行）。日志页整行显示，含 `[节点备注名]` 与 `[保留]/[丢弃]` 标签，可直接按节点核对迭代轮次。
+
 ## 安装与使用
 
 1.  从 [Releases](https://github.com/urbanescavenger/luci-app-passwall-speedtest/releases) 页面下载最新的 `.ipk` 或 `.apk` 文件。
