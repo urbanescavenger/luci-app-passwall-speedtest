@@ -385,8 +385,8 @@ node_test_cleanup() {
         nt_rollback
     fi
     rm -f "${NT_SNAP_FILE}" "${NT_ORIG_FILE}" 2>/dev/null
-    # 清理首完成即停用的完成标记、迭代轮次临时结果与停止标志（含中断退出残留）
-    rm -f "${RESULT_DIR}"/result.csv.tmp.*.done "${RESULT_DIR}"/result.csv.tmp.*.end "${RESULT_DIR}"/result.csv.tmp.*.pass "${RESULT_DIR}/.nt_stop" 2>/dev/null
+    # 清理首完成即停用的完成标记、迭代轮次临时结果、轮次 meta 与停止标志（含中断退出残留）
+    rm -f "${RESULT_DIR}"/result.csv.tmp.*.done "${RESULT_DIR}"/result.csv.tmp.*.end "${RESULT_DIR}"/result.csv.tmp.*.pass "${RESULT_DIR}"/result.csv.tmp.*.meta "${RESULT_DIR}/.nt_stop" 2>/dev/null
 }
 
 nt_lock_acquire() { while ! mkdir "${NT_LOCKDIR}" 2>/dev/null; do sleep 0.1; done; }
@@ -556,14 +556,33 @@ node_test_worker() {
     fi
 }
 
+# 打印某节点最终轮（最近一次落盘）的完整测速结果：首行节点名，之后逐行一条测速结果：
+#   迭代 [节点名] 最终结果（第 N 轮）:
+#     IP 延迟 Xms 丢包 Y
+#     ...
+# 无最终轮（.meta 缺失，该节点本轮从未有通过 IP）时不打印，返回 1。
+# 参数: $1=节点备注名 $2=结果文件
+iterate_log_final_summary(){
+    local _nm="$1" _rf="$2" _lp
+    _lp=$(cat "${_rf}.meta" 2>/dev/null)
+    [ -n "$_lp" ] || return 1
+    echolog "迭代 [${_nm}] 最终结果（第 ${_lp} 轮）:"
+    sed '1d' "$_rf" 2>/dev/null | awk -F, 'NF>=7 && $1!="" {print $1, $5, $4}' | \
+        while read -r _ip _avg _loss; do
+            echolog "  ${_ip} 延迟 ${_avg}ms 丢包 ${_loss}"
+        done
+    return 0
+}
+
 # 迭代模式 worker：每个待测节点一个独立收敛循环，直到 deadline 或停止标志。
 # 候选列表存 RESULT_DIR/iterate_cand_<节点>（该节点自己的临时待测 IP 列表）：
 #   第 1 轮 = 初始候选（$4），此后每轮只保留通过 IP（按延迟升序）作为下一轮候选，
 #   逐轮收敛出「最稳定基础上延迟最低」的集合。到点后留下的就是最稳的 IP。
-# 结果文件 $3 每轮完成时原子覆盖（首行=该节点当前最优）；中途不写 result.csv、不动 passwall。
+# 结果文件 $3 启动时先写表头（截断上次运行残留），每轮完成时原子覆盖（首行=该节点当前最优）；
+# 中途不写 result.csv、不动 passwall。
 # 终止条件：到点 / 停止标志 / 本轮通过数为 0（保留上一轮结果）/ 候选收敛到 ≤ITERATE_KEEP_MAX。
 # 每 IP 之间也检查 deadline/停止标志，到点跑完当前 IP 即停，无全局轮次同步。
-# 结束时打出该节点最终轮（最近一次落盘）的完整测速结果。
+# 结束时把最终轮次号写入 $3.meta；最终轮完整测速结果由合并段统一打出（收尾日志逐节点汇总）。
 # 参数: $1=idx $2=node $3=result_file $4=ip_list $5=probe_url $6=timeout $7=probes $8=socks_port $9=flag $10=deadline(epoch)
 node_iterate_worker() {
     local _idx=$1 _W=$2 _rfile=$3 _ips=$4 _purl=$5 _tmo=$6 _probes=$7 _port=$8 _flag=$9 _deadline=${10}
@@ -573,6 +592,9 @@ node_iterate_worker() {
     local _Wn
     _Wn="$(uci -q get "passwall.${_W}.remarks" 2>/dev/null)"; _Wn="${_Wn:-${_W}}"
     printf '%s\n' "$_ips" | grep -vE '^[[:space:]]*#|^[[:space:]]*$' > "$_cand"
+    # 表头截断旧文件：上一次运行中断残留的 result.csv.tmp.<节点> 不能当成本次结果写回
+    echo "IP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码" > "$_rfile"
+    rm -f "${_rfile}.meta" 2>/dev/null
     while :; do
         # 到点 / 用户停止（.nt_stop 与 .iter_stop 都查）→ 跑完当前判定即退
         [ -f "${RESULT_DIR}/.nt_stop" ] && break
@@ -623,12 +645,9 @@ node_iterate_worker() {
         fi
         [ "$(wc -l < "$_cand" | tr -d ' ')" -eq 0 ] && break
     done
-    # 结束摘要：该节点最终轮（最近一次落盘的通过集）完整测速结果
-    if [ "${_lastpass:-0}" -ge 1 ]; then
-        local _rows
-        _rows=$(sed '1d' "$_rfile" 2>/dev/null | awk -F, 'NF>=7 && $1!="" {printf "%s %sms; ", $1, $5}')
-        echolog "迭代 [${_Wn}] 最终结果（第 ${_lastpass} 轮）: ${_rows}"
-    fi
+    # 结束摘要：轮次号落盘（最终轮完整测速结果由合并段统一打出，保证收尾日志逐节点齐全；
+    # 不在 worker 退出点打印——提前收敛的节点其结果会被淹没在收尾段之前的进度行里）
+    [ "${_lastpass:-0}" -ge 1 ] && echo "${_lastpass}" > "${_rfile}.meta"
     # 完成标记（到点/停止后写，主进程 wait 收尸后合并）
     if [ -n "$(first_result_ip "$_rfile")" ]; then
         : > "${_rfile}.done"
@@ -829,7 +848,7 @@ node_speed_test() {
                 fi
             fi
             NT_RUNNING=""
-            rm -f "${RESULT_DIR}"/result.csv.tmp.*.done "${RESULT_DIR}"/result.csv.tmp.*.end "${RESULT_DIR}"/result.csv.tmp.*.pass "${RESULT_DIR}/.nt_stop" 2>/dev/null
+            rm -f "${RESULT_DIR}"/result.csv.tmp.*.done "${RESULT_DIR}"/result.csv.tmp.*.end "${RESULT_DIR}"/result.csv.tmp.*.pass "${RESULT_DIR}"/result.csv.tmp.*.meta "${RESULT_DIR}/.nt_stop" 2>/dev/null
             # 各 worker 写回各自最优（串行，单进程无锁）
             local merged reapply
             merged="$(mktemp "${RESULT_DIR}/result.csv.merged.XXXXXX")"
@@ -851,9 +870,12 @@ node_speed_test() {
                 else
                     echolog "走节点测速 [${mwname}] 结果为空，保留原 address"
                 fi
+                # 迭代模式：收尾段逐节点打出该节点最终轮（最近一次落盘）的完整测速结果——
+                # worker 无论提前收敛还是跑到时限退出，此处统一按「节点名一行 + 逐行结果」汇总
+                [ "${ITERATE_MODE:-0}" = "1" ] && iterate_log_final_summary "$mwname" "$mwfile"
                 # awk 过滤丢掉被杀 worker kill -9 中途截断的脏行（NF<7），正常 7 列行等价
                 sed '1d' "$mwfile" 2>/dev/null | awk -F, 'NF>=7 && $1!=""' >> "$merged"
-                rm -f "$mwfile"
+                rm -f "$mwfile" "${mwfile}.meta" 2>/dev/null
             done < "$NT_ORIG_FILE"
             rm -f "${NT_ORIG_FILE}"; NT_ORIG_FILE=""
             # 合并结果按延迟升序排，供 UI/图表展示（首行=全局最低延迟，供 DNS/host 用）
@@ -931,6 +953,10 @@ node_speed_test() {
         # 限时迭代：该节点跑独立收敛循环到时限，结果文件同路径，末尾统一合并写回（仅一次）
         echolog "迭代模式：节点 ${NODE_TEST_NODE} 独立收敛循环至时限（${NT_ITER_DEADLINE} 截止）"
         node_iterate_worker 1 "${NODE_TEST_NODE}" "$result_tmp" "$ip_list" "$probe_url" "$timeout" "$probes" 48900 "${NODE_TEST_FLAG_BASE}" "$NT_ITER_DEADLINE"
+        # 单节点迭代路径无合并段，最终轮完整测速结果在此打出（多 worker 路径在合并段打）
+        local _nm
+        _nm="$(uci -q get "passwall.${NODE_TEST_NODE}.remarks" 2>/dev/null)"; _nm="${_nm:-${NODE_TEST_NODE}}"
+        iterate_log_final_summary "$_nm" "$result_tmp"
     else
         node_test_worker 1 "${NODE_TEST_NODE}" "${NODE_TEST_ORIG_ADDR}" "$result_tmp" "$ip_list" "$probe_url" "$timeout" "$probes" 48900 "${NODE_TEST_FLAG_BASE}"
     fi
