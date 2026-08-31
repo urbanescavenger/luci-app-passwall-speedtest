@@ -9,6 +9,9 @@ IPV6_TXT='/usr/share/passwall-speedtest/ipv6.txt'
 
 SCRIPT_DIR='/usr/bin/passwall-speedtest'
 
+# 迭代模式：单节点候选收敛到 ≤ 此数量即保存结果提前结束（继续复测收益小）
+ITERATE_KEEP_MAX=3
+
 function get_global_config(){
     while [[ "$*" != "" ]]; do
         eval ${1}='`uci get passwall-speedtest.global.$1`' 2>/dev/null
@@ -558,13 +561,14 @@ node_test_worker() {
 #   第 1 轮 = 初始候选（$4），此后每轮只保留通过 IP（按延迟升序）作为下一轮候选，
 #   逐轮收敛出「最稳定基础上延迟最低」的集合。到点后留下的就是最稳的 IP。
 # 结果文件 $3 每轮完成时原子覆盖（首行=该节点当前最优）；中途不写 result.csv、不动 passwall。
-# 任一轮通过数为 0 → 该节点无存活 IP，保留上一轮结果并退出。
+# 终止条件：到点 / 停止标志 / 本轮通过数为 0（保留上一轮结果）/ 候选收敛到 ≤ITERATE_KEEP_MAX。
 # 每 IP 之间也检查 deadline/停止标志，到点跑完当前 IP 即停，无全局轮次同步。
+# 结束时打出该节点最终轮（最近一次落盘）的完整测速结果。
 # 参数: $1=idx $2=node $3=result_file $4=ip_list $5=probe_url $6=timeout $7=probes $8=socks_port $9=flag $10=deadline(epoch)
 node_iterate_worker() {
     local _idx=$1 _W=$2 _rfile=$3 _ips=$4 _purl=$5 _tmo=$6 _probes=$7 _port=$8 _flag=$9 _deadline=${10}
     local _cand="${RESULT_DIR}/iterate_cand_${_W}"
-    local _pass=0 _ip _list _total _passfile
+    local _pass=0 _lastpass=0 _kept _ip _list _total _passfile
     # 日志用节点备注名（无 remarks 则回退节点 id）；uci -q get 直读配置，子 shell 可用
     local _Wn
     _Wn="$(uci -q get "passwall.${_W}.remarks" 2>/dev/null)"; _Wn="${_Wn:-${_W}}"
@@ -604,7 +608,14 @@ node_iterate_worker() {
             mv -f "$_passfile" "$_rfile"
             sed -n '2,$p' "$_rfile" 2>/dev/null | grep -v '^#' | awk -F, 'NF>=7 && $1!="" {print $1}' > "${_cand}.new"
             mv -f "${_cand}.new" "$_cand"
-            echolog "迭代 [${_Wn}] 第 ${_pass} 轮完成，通过 $(wc -l < "$_cand" | tr -d ' ')/${_total}"
+            _lastpass=$_pass
+            _kept=$(wc -l < "$_cand" | tr -d ' ')
+            echolog "迭代 [${_Wn}] 第 ${_pass} 轮完成，通过 ${_kept}/${_total}"
+            # 收敛终止：剩余 ≤ ITERATE_KEEP_MAX 个时不再复测，保存当前结果提前结束
+            if [ "$_kept" -le "$ITERATE_KEEP_MAX" ]; then
+                echolog "迭代 [${_Wn}] 候选收敛至 ${_kept} 个，保存结果，该节点提前结束"
+                break
+            fi
         else
             rm -f "$_passfile"
             echolog "迭代 [${_Wn}] 第 ${_pass} 轮全部失败，保留第 $((_pass - 1)) 轮结果，该节点提前结束"
@@ -612,6 +623,12 @@ node_iterate_worker() {
         fi
         [ "$(wc -l < "$_cand" | tr -d ' ')" -eq 0 ] && break
     done
+    # 结束摘要：该节点最终轮（最近一次落盘的通过集）完整测速结果
+    if [ "${_lastpass:-0}" -ge 1 ]; then
+        local _rows
+        _rows=$(sed '1d' "$_rfile" 2>/dev/null | awk -F, 'NF>=7 && $1!="" {printf "%s %sms; ", $1, $5}')
+        echolog "迭代 [${_Wn}] 最终结果（第 ${_lastpass} 轮）: ${_rows}"
+    fi
     # 完成标记（到点/停止后写，主进程 wait 收尸后合并）
     if [ -n "$(first_result_ip "$_rfile")" ]; then
         : > "${_rfile}.done"
