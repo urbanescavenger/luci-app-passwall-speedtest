@@ -59,6 +59,21 @@ function read_lines(path) {
 	return split(replace(content, /\r/g, ''), '\n');
 }
 
+// 注意：本文件以 'use strict' 开头，ucode 严格模式下函数声明不提升（forward
+// reference 会报 undeclared）——被新函数调用的辅助函数必须定义在调用者之前。
+function load_config(cur, name) {
+	if (!fs.access('/etc/config/' + name, 'f'))
+		return false;
+
+	try {
+		cur.load(name);
+		return true;
+	}
+	catch (e) {
+		return false;
+	}
+}
+
 function file_size(path) {
 	let res = command_output('wc -c < ' + shquote(path) + ' 2>/dev/null');
 	let size = int(trim(res.stdout || '') || 0);
@@ -349,19 +364,6 @@ function get_best_result() {
 function add_node(nodes, name, label, type) {
 	if (name)
 		push(nodes, { value: name, label: label || name, type: type || '' });
-}
-
-function load_config(cur, name) {
-	if (!fs.access('/etc/config/' + name, 'f'))
-		return false;
-
-	try {
-		cur.load(name);
-		return true;
-	}
-	catch (e) {
-		return false;
-	}
 }
 
 function sorted_nodes(nodes) {
