@@ -210,13 +210,63 @@ function get_history() {
 
 function get_best_result() {
 	let lines = read_lines(RESULT_FILE);
-	// 迭代模式各节点最终通过集可能上千行，取末尾 500 行保证逐节点结果在前端基本可见
-	let start = length(lines) > 500 ? length(lines) - 500 : 0;
+	// 按节点独立排序展示：result.csv 本身保持全局延迟升序（DNS 取全局最优/前 N 依赖首行序），
+	// 此处在展示层按末列节点分组——全局升序里各节点行天然组内延迟升序，每组首行即该节点
+	// 自己的最优 IP。节点顺序 = 其最优 IP 在全局排序中首次出现的顺序（即按各节点最优延迟升序）。
+	// 全量展示（日志的「其余 N 条见最佳 IP 表」指向这里），不再截尾 500 行。
+	let header = '';
+	let time_line = '';
+	let order = [];
+	let rows = {};
+
+	for (let i = 0; i < length(lines); i++) {
+		let line = trim(lines[i] != null ? lines[i] : '');
+
+		if (line == '')
+			continue;
+
+		if (substr(line, 0, 1) == '#') {
+			if (match(line, /^# Speed test time:/))
+				time_line = line;
+
+			continue;
+		}
+
+		if (header == '') {
+			header = line;
+			continue;
+		}
+
+		let parts = split(line, ',');
+		let node = (length(parts) > 0) ? parts[length(parts) - 1] : '';
+
+		if (!rows[node]) {
+			rows[node] = [];
+			push(order, node);
+		}
+
+		push(rows[node], line);
+	}
+
 	let out = [];
 
-	for (let i = start; i < length(lines); i++)
-		if (lines[i] != null)
-			push(out, lines[i]);
+	if (header != '')
+		push(out, header);
+
+	for (let i = 0; i < length(order); i++) {
+		let node_rows = rows[order[i]];
+		let best = (length(node_rows) > 0) ? split(node_rows[0], ',') : [];
+
+		push(out, '# ── ' + (order[i] != '' ? order[i] : '(无节点)') +
+			'：最优 ' + (best[0] || '-') + ' / ' + (best[4] || '-') + 'ms，共 ' +
+			length(node_rows) + ' 条 ──');
+
+		for (let j = 0; j < length(node_rows); j++)
+			push(out, node_rows[j]);
+	}
+
+	if (time_line != '')
+		push(out, time_line);
 
 	return {
 		content: join('\n', out)
