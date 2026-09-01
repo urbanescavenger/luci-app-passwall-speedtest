@@ -556,21 +556,25 @@ node_test_worker() {
     fi
 }
 
-# 打印某节点最终轮（最近一次落盘）的完整测速结果：首行节点名，之后逐行一条测速结果：
-#   迭代 [节点名] 最终结果（第 N 轮）:
+# 打印某节点最终轮（最近一次落盘）的测速结果：首行节点名，之后逐行一条测速结果：
+#   迭代 [节点名] 最终结果（第 N 轮，共 M 条，完整列表见最佳 IP 表）:
 #     IP 延迟 Xms 丢包 Y
 #     ...
+# 日志只列延迟最低的前 ITER_SUMMARY_MAX 条（中止场景一轮可能通过数百条，全量会刷爆
+# 日志）；该节点全部通过行已按节点写入 result.csv（最佳 IP 表，前端可见）。
 # 无最终轮（.meta 缺失，该节点本轮从未有通过 IP）时不打印，返回 1。
 # 参数: $1=节点备注名 $2=结果文件
 iterate_log_final_summary(){
-    local _nm="$1" _rf="$2" _lp
+    local _nm="$1" _rf="$2" _lp _n
     _lp=$(cat "${_rf}.meta" 2>/dev/null)
     [ -n "$_lp" ] || return 1
-    echolog "迭代 [${_nm}] 最终结果（第 ${_lp} 轮）:"
-    sed '1d' "$_rf" 2>/dev/null | awk -F, 'NF>=7 && $1!="" {print $1, $5, $4}' | \
+    _n=$(sed '1d' "$_rf" 2>/dev/null | awk -F, 'NF>=7 && $1!="" {c++} END{print c+0}')
+    echolog "迭代 [${_nm}] 最终结果（第 ${_lp} 轮，共 ${_n} 条，完整列表见最佳 IP 表）:"
+    sed '1d' "$_rf" 2>/dev/null | awk -F, 'NF>=7 && $1!="" {print $1, $5, $4}' | head -n 10 | \
         while read -r _ip _avg _loss; do
             echolog "  ${_ip} 延迟 ${_avg}ms 丢包 ${_loss}"
         done
+    [ "${_n:-0}" -gt 10 ] && echolog "  ……其余 $((_n - 10)) 条见最佳 IP 表（已按节点写入 result.csv）"
     return 0
 }
 
@@ -848,12 +852,14 @@ node_speed_test() {
                 fi
             fi
             NT_RUNNING=""
-            rm -f "${RESULT_DIR}"/result.csv.tmp.*.done "${RESULT_DIR}"/result.csv.tmp.*.end "${RESULT_DIR}"/result.csv.tmp.*.pass "${RESULT_DIR}"/result.csv.tmp.*.meta "${RESULT_DIR}/.nt_stop" 2>/dev/null
+            # 注意：这里不能删 result.csv.tmp.*.meta——合并段还要读它打逐节点最终结果；
+            # .meta 由合并循环逐个删除（随 mwfile），中断残留由 node_test_cleanup 兜底
+            rm -f "${RESULT_DIR}"/result.csv.tmp.*.done "${RESULT_DIR}"/result.csv.tmp.*.end "${RESULT_DIR}"/result.csv.tmp.*.pass "${RESULT_DIR}/.nt_stop" 2>/dev/null
             # 各 worker 写回各自最优（串行，单进程无锁）
             local merged reapply
             merged="$(mktemp "${RESULT_DIR}/result.csv.merged.XXXXXX")"
             reapply="$(mktemp "${RESULT_DIR}/node_test_reapply.XXXXXX")"
-            echo "IP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码" > "$merged"
+            echo "IP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码,节点" > "$merged"
             local mi mw morig mwfile mwbest
             while read -r mi mw morig; do
                 [ -n "$mw" ] || continue
@@ -873,8 +879,10 @@ node_speed_test() {
                 # 迭代模式：收尾段逐节点打出该节点最终轮（最近一次落盘）的完整测速结果——
                 # worker 无论提前收敛还是跑到时限退出，此处统一按「节点名一行 + 逐行结果」汇总
                 [ "${ITERATE_MODE:-0}" = "1" ] && iterate_log_final_summary "$mwname" "$mwfile"
-                # awk 过滤丢掉被杀 worker kill -9 中途截断的脏行（NF<7），正常 7 列行等价
-                sed '1d' "$mwfile" 2>/dev/null | awk -F, 'NF>=7 && $1!=""' >> "$merged"
+                # awk 过滤丢掉被杀 worker kill -9 中途截断的脏行（NF<7），正常 7 列行等价；
+                # 末列追加节点备注名（逗号替换为空格防 CSV 断列），供前端按节点查看
+                local _nname="${mwname//,/ }"
+                sed '1d' "$mwfile" 2>/dev/null | awk -F, -v n="$_nname" 'NF>=7 && $1!="" {print $0 "," n}' >> "$merged"
                 rm -f "$mwfile" "${mwfile}.meta" 2>/dev/null
             done < "$NT_ORIG_FILE"
             rm -f "${NT_ORIG_FILE}"; NT_ORIG_FILE=""
@@ -967,6 +975,13 @@ node_speed_test() {
         node_test_cleanup; trap - EXIT INT TERM
         return 1
     fi
+
+    # 数据行末列追加节点备注名（与多 worker 合并段的 result.csv 列结构一致，逗号替换为空格防 CSV 断列）
+    local _nm2="${NODE_TEST_NODE}"
+    _nm2="$(uci -q get "passwall.${NODE_TEST_NODE}.remarks" 2>/dev/null)"; _nm2="${_nm2//,/ }"; _nm2="${_nm2:-${NODE_TEST_NODE}}"
+    awk -F, -v n="$_nm2" 'NR==1 {print $0 ",节点"; next} NF>=7 && $1!="" && $1 !~ /^#/ {print $0 "," n}' \
+        "$result_tmp" > "${result_tmp}.nn" 2>/dev/null \
+        && [ -s "${result_tmp}.nn" ] && mv -f "${result_tmp}.nn" "$result_tmp"
 
     echo "# Speed test time: $(date +'%Y-%m-%d %H:%M:%S')" >> "$result_tmp"
     rotate_result_files

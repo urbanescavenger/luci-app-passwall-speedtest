@@ -210,7 +210,8 @@ function get_history() {
 
 function get_best_result() {
 	let lines = read_lines(RESULT_FILE);
-	let start = length(lines) > 100 ? length(lines) - 100 : 0;
+	// 迭代模式各节点最终通过集可能上千行，取末尾 500 行保证逐节点结果在前端基本可见
+	let start = length(lines) > 500 ? length(lines) - 500 : 0;
 	let out = [];
 
 	for (let i = start; i < length(lines); i++)
