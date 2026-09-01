@@ -201,20 +201,59 @@ return view.extend({
 		if (!latencyCanvas)
 			return;
 
-		const labels = dataPoints.map(d => d.time);
-		const latencyData = dataPoints.map(d => d.latency);
+		// 每个配置节点一条线：按 passwall 多节点配置的节点序号分组，同序号（同一配置行）
+		// 的历次「该节点最优 IP」连成一条线，序号未在当次结果中出现的运行自然断开。
+		// 悬停 tooltip 与点击弹窗均显示「节点名：最优 IP / 延迟ms」。
+		// 旧数据（result.csv 无节点列）退化为单条全局最优线。
+		const runs = dataPoints.slice().sort((a, b) => (a.time > b.time ? 1 : (a.time < b.time ? -1 : 0)));
+		const series = {};
+		const seriesOrder = [];
 
-		const tooltip = unitText => ({
-			mode: 'index',
-			intersect: false,
-			callbacks: {
-				title: ctx => _('Time') + ': ' + ctx[0].label,
-				beforeBody: ctx => {
-					const d = dataPoints[ctx[0].dataIndex];
-					return 'IP: %s, %s: %s'.format(d.ip, _('Region'), d.region);
-				},
-				label: ctx => '%s: %s %s'.format(ctx.dataset.label, ctx.parsed.y, unitText)
+		for (let i = 0; i < runs.length; i++) {
+			const run = runs[i];
+			const pts = (run.nodes && run.nodes.length)
+				? run.nodes
+				: [{ node: '', idx: null, ip: run.ip, latency: run.latency, region: run.region }];
+
+			for (let j = 0; j < pts.length; j++) {
+				const n = pts[j];
+				const key = (n.idx != null) ? 'idx:' + n.idx : 'name:' + (n.node || '');
+
+				if (!series[key]) {
+					series[key] = [];
+					seriesOrder.push(key);
+				}
+
+				series[key].push({ x: run.time, y: n.latency, node: n.node, ip: n.ip, region: n.region });
 			}
+		}
+
+		const palette = [
+			['rgba(75, 192, 192, 1)', 'rgba(75, 192, 192, 0.2)'],
+			['rgba(255, 99, 132, 1)', 'rgba(255, 99, 132, 0.2)'],
+			['rgba(54, 162, 235, 1)', 'rgba(54, 162, 235, 0.2)'],
+			['rgba(255, 206, 86, 1)', 'rgba(255, 206, 86, 0.2)'],
+			['rgba(153, 102, 255, 1)', 'rgba(153, 102, 255, 0.2)'],
+			['rgba(255, 159, 64, 1)', 'rgba(255, 159, 64, 0.2)'],
+			['rgba(46, 204, 113, 1)', 'rgba(46, 204, 113, 0.2)'],
+			['rgba(231, 76, 60, 1)', 'rgba(231, 76, 60, 0.2)']
+		];
+
+		const datasets = seriesOrder.map(function(key, i) {
+			const pts = series[key];
+			// 图例取该序号最近一次的节点备注名（节点改名后显示当前名，悬停仍显示各点当时名称）
+			const last = pts[pts.length - 1];
+
+			return {
+				label: last.node || _('Latency'),
+				data: pts,
+				borderColor: palette[i % palette.length][0],
+				backgroundColor: palette[i % palette.length][1],
+				tension: 0.3,
+				fill: false,
+				pointRadius: 4,
+				pointHoverRadius: 6
+			};
 		});
 
 		const timeScale = {
@@ -238,22 +277,30 @@ return view.extend({
 		new Chart(latencyCanvas, {
 			type: 'line',
 			data: {
-				labels: labels,
-				datasets: [{
-					label: _('Latency'),
-					data: latencyData,
-					borderColor: 'rgba(75, 192, 192, 1)',
-					backgroundColor: 'rgba(75, 192, 192, 0.2)',
-					tension: 0.3,
-					fill: false,
-					pointRadius: 4
-				}]
+				datasets: datasets
 			},
 			options: {
 				responsive: true,
-				interaction: tooltip('ms'),
+				interaction: { mode: 'nearest', intersect: true },
+				onClick: function(evt, elements, chart) {
+					const els = chart.getElementsAtEventForMode(evt, 'nearest', { intersect: true }, false);
+
+					if (!els || !els.length)
+						return;
+
+					const p = chart.data.datasets[els[0].datasetIndex].data[els[0].index];
+
+					ui.showModal(p.node || _('Node'), pointDetail(p));
+				},
 				plugins: {
-					tooltip: tooltip('ms'),
+					tooltip: {
+						mode: 'nearest',
+						intersect: true,
+						callbacks: {
+							title: ctx => _('Time') + ': ' + (ctx[0].raw.x || ''),
+							label: ctx => pointLabel(ctx.raw)
+						}
+					},
 					legend: { position: 'top' }
 				},
 				scales: {
@@ -265,6 +312,18 @@ return view.extend({
 				}
 			}
 		});
+
+		function pointLabel(p) {
+			return '%s：最优 %s / %sms'.format(p.node || '-', p.ip, p.y);
+		}
+
+		function pointDetail(p) {
+			return [
+				E('p', {}, pointLabel(p)),
+				E('p', {}, _('Time') + ': ' + (p.x || '')),
+				(p.region ? E('p', {}, _('Region') + ': ' + p.region) : E([]))
+			];
+		}
 	},
 
 	render: function(data) {

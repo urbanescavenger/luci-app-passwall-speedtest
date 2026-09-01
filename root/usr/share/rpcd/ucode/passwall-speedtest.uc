@@ -138,64 +138,137 @@ function get_log(req) {
 	};
 }
 
-function parse_csv_file(path) {
-	let lines = read_lines(path);
+// worker 序号（1 起）：与脚本 worker 遍历顺序一致——node_ip 段（配置顺序）的 node 字段
+// 在前，兼容旧 servers.passwall_services 多选追加，按首次出现去重。
+// 图表连线按此序号分组：同序号（同一配置行）的历次结果相连。
+function worker_ids() {
+	let cur = uci.cursor();
+	let ids = [];
 
-	if (!length(lines))
-		return null;
+	if (load_config(cur, 'passwall-speedtest')) {
+		cur.foreach('passwall-speedtest', 'node_ip', s => {
+			if (s.node && index(ids, s.node) < 0)
+				push(ids, s.node);
+		});
 
-	let test_time = null;
-	let best_ip = null;
+		let legacy = cur.get('passwall-speedtest', 'servers', 'passwall_services');
 
-	for (let i = length(lines) - 1; i >= 0; i--) {
-		let m = match(trim(lines[i]), /^# Speed test time: (.+)$/);
-
-		if (m) {
-			test_time = m[1];
-			break;
+		if (type(legacy) == 'array') {
+			for (let i = 0; i < length(legacy); i++)
+				if (legacy[i] && index(ids, legacy[i]) < 0)
+					push(ids, legacy[i]);
+		}
+		else if (legacy != null && legacy != '') {
+			push(ids, legacy);
 		}
 	}
 
-	for (let i = 1; i < length(lines); i++) {
-		let line = trim(lines[i]);
+	return ids;
+}
 
-		if (line == '' || substr(line, 0, 1) == '#')
+// passwall 节点 section id → remarks（同名 remarks 以先出现者为准）
+function remarks_map() {
+	let cur = uci.cursor();
+	let m = {};
+
+	if (load_config(cur, 'passwall')) {
+		cur.foreach('passwall', 'nodes', s => {
+			if (s.remarks && m[s['.name']] == null)
+				m[s['.name']] = s.remarks;
+		});
+	}
+
+	return m;
+}
+
+// 解析一次运行的结果文件：全局最优（首条数据行）+ 各节点自己的最优
+// （result.csv 全局延迟升序，某节点末列值首次出现的行即该节点最优）。
+// 节点不在 worker 配置内（如被移除/改名）时 idx 为 null，前端按节点名独立展示不连线。
+function parse_run_file(path, idx_of_remarks) {
+	let lines = read_lines(path);
+	let time = null;
+	let best = null;
+	let nodes = [];
+	let seen = {};
+	let header = '';
+
+	for (let i = 0; i < length(lines); i++) {
+		let line = trim(lines[i] != null ? lines[i] : '');
+
+		if (line == '')
 			continue;
+
+		if (substr(line, 0, 1) == '#') {
+			let m = match(line, /^# Speed test time: (.+)$/);
+
+			if (m)
+				time = m[1];
+
+			continue;
+		}
+
+		// 首个非注释行是表头，不能当作数据行（否则会混入「IP 地址」全局最优与「节点」假分组）
+		if (header == '') {
+			header = line;
+			continue;
+		}
 
 		let parts = split(line, ',');
 
-		if (length(parts) >= 7) {
-			best_ip = {
+		if (length(parts) < 7)
+			continue;
+
+		// 8 列 = ...,地区码,节点；7 列 = 旧格式无节点列，末列即地区码
+		let node = (length(parts) >= 8) ? parts[length(parts) - 1] : '';
+
+		if (!best)
+			best = { ip: parts[0], latency: +parts[4] || 0, speed: +parts[5] || 0, region: parts[6] };
+
+		if (node != '' && !seen[node]) {
+			seen[node] = true;
+			push(nodes, {
+				node: node,
+				idx: (idx_of_remarks[node] != null) ? idx_of_remarks[node] : null,
 				ip: parts[0],
 				latency: +parts[4] || 0,
-				speed: +parts[5] || 0,
-				region: parts[6]
-			};
-			break;
+				region: parts[6] || ''
+			});
 		}
 	}
 
-	if (!best_ip || !test_time)
+	if (!best || !time)
 		return null;
 
 	return {
-		time: test_time,
-		ip: best_ip.ip,
-		region: best_ip.region,
-		latency: best_ip.latency,
-		speed: best_ip.speed
+		time: time,
+		ip: best.ip,
+		region: best.region,
+		latency: best.latency,
+		speed: best.speed,
+		nodes: nodes
 	};
 }
 
 function get_history() {
 	let history = [];
-	let item = parse_csv_file(RESULT_FILE);
+	let idx_of_remarks = {};
+	let workers = worker_ids();
+	let remarks = remarks_map();
+
+	for (let i = 0; i < length(workers); i++) {
+		let r = remarks[workers[i]];
+
+		if (r != null && idx_of_remarks[r] == null)
+			idx_of_remarks[r] = i + 1;
+	}
+
+	let item = parse_run_file(RESULT_FILE, idx_of_remarks);
 
 	if (item)
 		push(history, item);
 
 	for (let i = 1; i <= 9; i++) {
-		item = parse_csv_file(RESULT_FILE + '.' + i);
+		item = parse_run_file(RESULT_FILE + '.' + i, idx_of_remarks);
 
 		if (item)
 			push(history, item);
