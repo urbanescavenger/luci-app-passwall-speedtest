@@ -17,7 +17,8 @@ return view.extend({
 			const content = (data && data.content) || '';
 
 			if (content.length > 0) {
-				textarea.value += content;
+				// 长时尾随时 textarea 无限增长会拖死页面：超过 512KB 只保留末尾
+				textarea.value = (textarea.value + content).slice(-524288);
 				textarea.scrollTop = textarea.scrollHeight;
 			}
 

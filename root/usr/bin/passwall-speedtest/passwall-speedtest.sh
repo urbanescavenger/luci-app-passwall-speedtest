@@ -130,6 +130,15 @@ function rotate_log_files(){
     mv -f "$LOG_FILE" "${LOG_FILE}.1"
 }
 
+# 日志超限滚动：单次长跑（迭代模式逐 IP 打进度行）会把 .log 撑到数 MB~数十 MB，
+# 拖慢 LuCI 日志页首次加载。超 10MB 就滚动归档（echolog 按路径追加，rename 后自动写新文件）。
+# 在 worker 每 IP 循环里调用（每次探测 5~10s 一回，wc -c 开销可忽略）。
+function log_size_guard(){
+    [ "$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)" -gt 10485760 ] && rotate_log_files && \
+        echolog "日志已超 10MB，滚动归档到 .log.1"
+    return 0
+}
+
 function rotate_result_files(){
     # 滚动保存result.csv文件，最多保存10个版本
     if [ -f "$IP_FILE" ]; then
@@ -555,6 +564,7 @@ node_test_worker() {
     printf '%s\n' "$_ips" | while read -r _ip; do
         [ -n "$_ip" ] || continue
         # 协作式提前停止：主循环首个有效结果完成后写 .nt_stop，本 worker 跑完当前 IP 即停
+        log_size_guard
         [ -f "${RESULT_DIR}/.nt_stop" ] && { echolog "worker [${_Wn}] 收到停止信号，跑完当前 IP 即停（已完成 ${_idx2}/${_total}）"; break; }
         _idx2=$((_idx2 + 1))
         local _out _keep _sent _recv _loss _avg
@@ -651,6 +661,7 @@ node_iterate_worker() {
         echo "IP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码" > "$_passfile"
         printf '%s\n' "$_list" | while read -r _ip; do
             [ -n "$_ip" ] || continue
+            log_size_guard
             [ -f "${RESULT_DIR}/.nt_stop" ] && { echolog "迭代 [${_Wn}] 第 ${_pass} 轮收到停止信号，跑完当前 IP 即停"; break; }
             [ -f "${RESULT_DIR}/.iter_stop" ] && break
             [ "$(date +%s)" -ge "$_deadline" ] && { echolog "迭代 [${_Wn}] 到达时长上限，跑完当前 IP 即停"; break; }

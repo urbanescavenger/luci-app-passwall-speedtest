@@ -82,7 +82,7 @@ function file_size(path) {
 	return size > 0 ? size : 0;
 }
 
-function read_file_chunk(path, pos) {
+function read_file_chunk(path, pos, first_tail) {
 	if (!fs.access(path, 'f'))
 		return { pos: 0, content: '' };
 
@@ -91,6 +91,11 @@ function read_file_chunk(path, pos) {
 
 	if (pos < 0 || pos > size)
 		pos = 0;
+
+	// 首次加载（pos=0）只取文件末尾 first_tail 字节：长跑日志动辄数 MB，
+	// 全量传到前端会把页面拖死（用户实测点击其它页签会崩溃）
+	if (pos == 0 && first_tail > 0 && size > first_tail)
+		pos = size - first_tail;
 
 	let pipe = fs.popen('dd if=' + shquote(path) + ' bs=1 skip=' + pos + ' count=1048576 2>/dev/null', 'r');
 	let content = '';
@@ -144,7 +149,8 @@ function stop() {
 }
 
 function get_log(req) {
-	let chunk = read_file_chunk(LOG_FILE, req.args.pos);
+	let pos = int(req.args.pos || 0);
+	let chunk = read_file_chunk(LOG_FILE, pos, (pos == 0) ? 262144 : 0);
 
 	// 原样返回整行（含 [节点] / [保留] 等方括号段）——此前把 [..] 替换成换行
 	// 会把节点 ID 和保留/丢弃标签从日志页吞掉，无法按节点核对轮次。
