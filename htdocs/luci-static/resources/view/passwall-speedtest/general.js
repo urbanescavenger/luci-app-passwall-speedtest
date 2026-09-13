@@ -290,7 +290,17 @@ return view.extend({
 
 					const p = chart.data.datasets[els[0].datasetIndex].data[els[0].index];
 
-					ui.showModal(p.node || _('Node'), pointDetail(p));
+					// ui.showModal 不自带关闭按钮，Escape 也只在内容含 .right > button 时生效；
+					// 不加按钮弹窗无法退出（只能刷新页面）
+					ui.showModal(p.node || _('Node'), [
+						E('div', {}, pointDetail(p)),
+						E('div', { 'class': 'right' }, [
+							E('button', {
+								'class': 'btn',
+								'click': function() { ui.hideModal(); }
+							}, _('Close'))
+						])
+					]);
 				},
 				plugins: {
 					tooltip: {

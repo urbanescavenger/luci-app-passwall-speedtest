@@ -5,6 +5,7 @@ const uci = require('uci');
 
 const LOG_FILE = '/tmp/passwall-speedtest.log';
 const RESULT_FILE = '/tmp/passwall-speedtest/result.csv';
+const HISTORY_FILE = '/etc/passwall-speedtest/history.csv';
 const RUN_SCRIPT = '/usr/bin/passwall-speedtest/passwall-speedtest.sh';
 
 function command(cmd) {
@@ -264,6 +265,75 @@ function parse_run_file(path, idx_of_remarks) {
 	};
 }
 
+// 解析持久历史文件（/etc/passwall-speedtest/history.csv）：多个
+// "# Speed test time: ..." 块，每块数据行 = 该次各节点最优（全局延迟升序去重首现）。
+// 修剪可能产生无时间头的孤立数据行，直接忽略（cur 为空时跳过）。
+function parse_history_file(path, idx_of_remarks) {
+	let lines = read_lines(path);
+	let runs = [];
+	let cur = null;
+
+	for (let i = 0; i < length(lines); i++) {
+		let line = trim(lines[i] != null ? lines[i] : '');
+
+		if (line == '')
+			continue;
+
+		if (substr(line, 0, 1) == '#') {
+			let m = match(line, /^# Speed test time: (.+)$/);
+
+			if (m) {
+				cur = { time: m[1], best: null, nodes: [], seen: {} };
+				push(runs, cur);
+			}
+
+			continue;
+		}
+
+		if (cur == null)
+			continue;
+
+		let parts = split(line, ',');
+
+		if (length(parts) < 7)
+			continue;
+
+		let node = (length(parts) >= 8) ? parts[length(parts) - 1] : '';
+
+		if (!cur.best)
+			cur.best = { ip: parts[0], latency: +parts[4] || 0, speed: +parts[5] || 0, region: parts[6] };
+
+		if (node != '' && !cur.seen[node]) {
+			cur.seen[node] = true;
+			push(cur.nodes, {
+				node: node,
+				idx: (idx_of_remarks[node] != null) ? idx_of_remarks[node] : null,
+				ip: parts[0],
+				latency: +parts[4] || 0,
+				region: parts[6] || ''
+			});
+		}
+	}
+
+	let out = [];
+
+	for (let i = 0; i < length(runs); i++) {
+		let r = runs[i];
+
+		if (r.best)
+			push(out, {
+				time: r.time,
+				ip: r.best.ip,
+				region: r.best.region,
+				latency: r.best.latency,
+				speed: r.best.speed,
+				nodes: r.nodes
+			});
+	}
+
+	return out;
+}
+
 function get_history() {
 	let history = [];
 	let idx_of_remarks = {};
@@ -277,16 +347,21 @@ function get_history() {
 			idx_of_remarks[r] = i + 1;
 	}
 
-	let item = parse_run_file(RESULT_FILE, idx_of_remarks);
+	// 持久历史为主（/etc 下，重启与轮转不清）；尚无归档时回退 /tmp 轮转文件（老安装）
+	history = parse_history_file(HISTORY_FILE, idx_of_remarks);
 
-	if (item)
-		push(history, item);
-
-	for (let i = 1; i <= 9; i++) {
-		item = parse_run_file(RESULT_FILE + '.' + i, idx_of_remarks);
+	if (!length(history)) {
+		let item = parse_run_file(RESULT_FILE, idx_of_remarks);
 
 		if (item)
 			push(history, item);
+
+		for (let i = 1; i <= 9; i++) {
+			item = parse_run_file(RESULT_FILE + '.' + i, idx_of_remarks);
+
+			if (item)
+				push(history, item);
+		}
 	}
 
 	sort(history, (a, b) => b.time > a.time ? 1 : (b.time < a.time ? -1 : 0));

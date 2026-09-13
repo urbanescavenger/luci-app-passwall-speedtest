@@ -152,6 +152,30 @@ function first_result_ip(){
     sed -n '2,$p' "$1" 2>/dev/null | grep -v '^#' | awk -F, 'NF >= 7 && $1 != "" { print $1; exit }'
 }
 
+# 持久历史：把每次合并的「各节点最优」追加到 /etc/passwall-speedtest/history.csv。
+# /tmp 下的 result.csv.* 是内存盘（重启即清）且仅 10 份，图表的长期历史依赖此文件。
+# 格式与 result.csv 兼容：每块以 "# Speed test time: ..." 开头，其后为该次各节点最优行
+# （全局延迟升序中每节点首次出现的行），每次 ≤ 待测节点数行。行数超限尾部修剪。
+HISTORY_DIR=/etc/passwall-speedtest
+HISTORY_MAX_LINES=5000
+function append_persistent_history(){
+    local mfile="$1"
+    [ -f "$mfile" ] || return 0
+    if mkdir -p "$HISTORY_DIR" 2>/dev/null; then
+        {
+            grep -a '^# Speed test time:' "$mfile" | head -n1
+            sed -n '2,$p' "$mfile" | grep -av '^#' | awk -F, 'NF>=8 && $1!="" && $8!="" && !seen[$8]++'
+        } >> "$HISTORY_DIR/history.csv"
+        if [ "$(wc -l < "$HISTORY_DIR/history.csv")" -gt "$HISTORY_MAX_LINES" ]; then
+            tail -n "$HISTORY_MAX_LINES" "$HISTORY_DIR/history.csv" \
+                > "$HISTORY_DIR/history.csv.new" && mv -f "$HISTORY_DIR/history.csv.new" "$HISTORY_DIR/history.csv"
+        fi
+        echolog "已归档本次各节点最优到 $HISTORY_DIR/history.csv"
+    else
+        echolog "警告：$HISTORY_DIR 不可写，本次结果未持久归档"
+    fi
+}
+
 # 按延迟升序排序结果数据行，表头保留在首行。
 # 兼容测速被中断、二进制未完成最终排序的情况，保证最快 IP 位于首行。
 # 第二参数 mode=latency 时（走节点测速模式，下载列恒 0.00）仅按延迟升序排。
@@ -596,7 +620,21 @@ node_iterate_worker() {
     local _Wn
     _Wn="$(uci -q get "passwall.${_W}.remarks" 2>/dev/null)"; _Wn="${_Wn:-${_W}}"
     printf '%s\n' "$_ips" | grep -vE '^[[:space:]]*#|^[[:space:]]*$' > "$_cand"
-    # 表头截断旧文件：上一次运行中断残留的 result.csv.tmp.<节点> 不能当成本次结果写回
+    # 上一会话（或中断残留）有数据的结果文件先挪到 .prev：本轮若一个 IP 都没通过，
+    # 退出时恢复它，避免「第 1 轮全部失败」把上一会话刚写回的最优 IP 清成空表
+    if sed -n '2,$p' "$_rfile" 2>/dev/null | grep -v '^#' | grep -q .; then
+        mv -f "$_rfile" "${_rfile}.prev"
+    fi
+    # 无中断残留时，用上一次合并结果（result.csv）中该节点的行初始化 .prev：
+    # 每次成功合并都会删除 result.csv.tmp.*，下会话本来无残留可挪；
+    # 有了这份 .prev，本会话一个 IP 都没通过时（如节点链路故障）能沿用上一次结果
+    if [ ! -f "${_rfile}.prev" ] && [ -f "$IP_FILE" ]; then
+        local _pname="${_Wn//,/ }"
+        sed -n '2,$p' "$IP_FILE" 2>/dev/null | grep -av '^#' | \
+            awk -F, -v n="$_pname" 'NF>=8 && $1!="" && $8==n' > "${_rfile}.prev"
+        [ -s "${_rfile}.prev" ] || rm -f "${_rfile}.prev"
+    fi
+    # 本轮结果从空表开始，只有通过集落盘时才覆盖；残留文件不再被当作本轮结果合并
     echo "IP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码" > "$_rfile"
     rm -f "${_rfile}.meta" 2>/dev/null
     while :; do
@@ -649,6 +687,14 @@ node_iterate_worker() {
         fi
         [ "$(wc -l < "$_cand" | tr -d ' ')" -eq 0 ] && break
     done
+    # 本会话拿到过通过集 → 上一会话残留已无意义；一个都没通过 → 恢复上一会话结果，
+    # 使合并段沿用其最优 IP 写回（幂等），而不是报「结果为空，保留原 address」
+    if [ "${_lastpass:-0}" -ge 1 ]; then
+        rm -f "${_rfile}.prev" 2>/dev/null
+    elif [ -f "${_rfile}.prev" ]; then
+        mv -f "${_rfile}.prev" "$_rfile"
+        echolog "迭代 [${_Wn}] 本会话无通过 IP，沿用上一会话结果"
+    fi
     # 结束摘要：轮次号落盘（最终轮完整测速结果由合并段统一打出，保证收尾日志逐节点齐全；
     # 不在 worker 退出点打印——提前收敛的节点其结果会被淹没在收尾段之前的进度行里）
     [ "${_lastpass:-0}" -ge 1 ] && echo "${_lastpass}" > "${_rfile}.meta"
@@ -883,7 +929,7 @@ node_speed_test() {
                 # 末列追加节点备注名（逗号替换为空格防 CSV 断列），供前端按节点查看
                 local _nname="${mwname//,/ }"
                 sed '1d' "$mwfile" 2>/dev/null | awk -F, -v n="$_nname" 'NF>=7 && $1!="" {print $0 "," n}' >> "$merged"
-                rm -f "$mwfile" "${mwfile}.meta" 2>/dev/null
+                rm -f "$mwfile" "${mwfile}.meta" "${mwfile}.prev" 2>/dev/null
             done < "$NT_ORIG_FILE"
             rm -f "${NT_ORIG_FILE}"; NT_ORIG_FILE=""
             # 合并结果按延迟升序排，供 UI/图表展示（首行=全局最低延迟，供 DNS/host 用）
@@ -895,6 +941,7 @@ node_speed_test() {
                 return 1
             fi
             echo "# Speed test time: $(date +'%Y-%m-%d %H:%M:%S')" >> "$merged"
+            append_persistent_history "$merged"
             rotate_result_files
             mv -f "$merged" "$IP_FILE"
             bestip=$(first_result_ip "$IP_FILE")
