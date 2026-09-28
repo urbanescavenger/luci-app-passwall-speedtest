@@ -4,6 +4,16 @@ LOG_FILE='/tmp/passwall-speedtest.log'
 PERSIST_LOG='/etc/config/passwall-speedtest.log'
 RESULT_DIR='/tmp/passwall-speedtest'
 IP_FILE="$RESULT_DIR/result.csv"
+# ── 单实例运行锁与会话私有状态目录 ───────────────────────────
+# 触发来源(cron 表达式写成 `* 19 * * 4` 时一小时能触发几十次、UI 连点、SSH 手敲)可能同时
+# 拉起多个整跑进程。它们共用同一批 passwall worker 节点和同一份中间状态文件，会互相改写
+# address、互删完成标记(如 result.csv.tmp.*.done)、互相触发「首完成即停」，最后各自拿到
+# 残缺结果；失败路径还会整份还原 passwall 快照，把别人刚写回的 IP 一并抹掉。
+# 故：① 整跑入口抢一把单实例锁；② 全部中间状态下沉到按主进程 PID 命名的会话目录 RUN_DIR。
+# 共享产物(result.csv / result.csv.N / history.csv / 日志)是给 UI 看的，仍留在原路径。
+RUN_LOCK_DIR="$RESULT_DIR/.run.lock"
+RUN_PID_FILE="$RESULT_DIR/current_run"
+RUN_DIR=""
 IPV4_TXT='/usr/share/passwall-speedtest/ip.txt'
 IPV6_TXT='/usr/share/passwall-speedtest/ipv6.txt'
 
@@ -30,6 +40,85 @@ echolog() {
     local d="$(date "+%Y-%m-%d %H:%M:%S")"
     echo -e "$d: $*"
     echo -e "$d: $*" >>$LOG_FILE
+}
+
+# 抢整跑单实例锁。成功返回 0 并建好会话目录 RUN_DIR；已有整跑在跑则返回 1（调用方跳过本次）。
+# 会话目录名用主进程 PID：worker 都是 fork 出来的子 shell，$$ 仍是主进程 PID
+# （NODE_TEST_FLAG_BASE 也依赖这一点），故整个会话内取值稳定。
+run_lock_acquire() {
+    local _pid _alive _started _now _cap _tries=0
+    mkdir -p "$RESULT_DIR" 2>/dev/null || { echolog "无法创建 $RESULT_DIR，本次跳过"; return 1; }
+    while :; do
+        if mkdir "$RUN_LOCK_DIR" 2>/dev/null; then
+            echo "$$" > "$RUN_LOCK_DIR/pid"
+            date +%s > "$RUN_LOCK_DIR/started"
+            RUN_DIR="$RESULT_DIR/run.$$"
+            rm -rf "$RUN_DIR" 2>/dev/null
+            if ! mkdir -p "$RUN_DIR" 2>/dev/null; then
+                echolog "创建会话目录 $RUN_DIR 失败，本次跳过"
+                rm -rf "$RUN_LOCK_DIR"; RUN_DIR=""
+                return 1
+            fi
+            echo "$$" > "$RUN_PID_FILE"
+            reap_stale_run_dirs
+            return 0
+        fi
+        # 锁已存在：持有者还活着就谦让；已被 kill -9 / 断电 / 崩溃带走时接管。
+        # cmdline 比对既排除「PID 被无关进程复用」的假存活，也让未被收尸的僵尸
+        # (kill -9 后父进程还没 wait) 被正确判为已死——僵尸的 cmdline 是空的。
+        # 前提：脚本按本名调用（cron/SSH/UI 都是全路径调用），不要改名或换成别名。
+        _pid="$(cat "$RUN_LOCK_DIR/pid" 2>/dev/null)"
+        _alive=0
+        if [ -n "$_pid" ] && [ -d "/proc/$_pid" ] && \
+           grep -q 'passwall-speedtest\.sh' "/proc/$_pid/cmdline" 2>/dev/null; then
+            _alive=1
+        fi
+        if [ "$_alive" = "1" ]; then
+            # 兜底：锁龄超过该配置允许的最长运行时间仍不释放 → 视为僵死会话接管。
+            # 迭代模式有硬上限 iterate_minutes；普通模式无硬上限，给 12 小时。
+            _started="$(cat "$RUN_LOCK_DIR/started" 2>/dev/null)"
+            case "$_started" in ''|*[!0-9]*) _started=0 ;; esac
+            _now="$(date +%s)"
+            if [ "${iterate_enabled:-0}" = "1" ] && [ "${iterate_minutes:-0}" -ge 1 ] 2>/dev/null; then
+                _cap=$(( iterate_minutes * 60 + 1800 ))
+            else
+                _cap=43200
+            fi
+            if [ "$_started" -gt 0 ] && [ $((_now - _started)) -gt "$_cap" ]; then
+                echolog "运行锁已持有 $((_now - _started))s 超过上限 ${_cap}s（PID ${_pid} 疑似僵死），接管"
+            else
+                return 1
+            fi
+        else
+            echolog "运行锁为残留（PID ${_pid:-未知} 已不存在），接管"
+        fi
+        rm -rf "$RUN_LOCK_DIR"
+        _tries=$((_tries + 1))
+        [ "$_tries" -lt 3 ] || { echolog "运行锁接管失败，本次跳过"; return 1; }
+    done
+}
+
+# 释放运行锁并删掉本会话目录。非持有者调用是 no-op（避免误删接管者的锁）。
+run_lock_release() {
+    [ "$(cat "$RUN_LOCK_DIR/pid" 2>/dev/null)" = "$$" ] || { RUN_DIR=""; return 0; }
+    [ -n "$RUN_DIR" ] && rm -rf "$RUN_DIR" 2>/dev/null
+    rm -f "$RUN_PID_FILE" 2>/dev/null
+    rm -rf "$RUN_LOCK_DIR" 2>/dev/null
+    RUN_DIR=""
+    return 0
+}
+
+# 清掉上次异常退出留下的会话目录（进程已不在），防 /tmp 内存盘被 IP 列表/结果文件撑满。
+reap_stale_run_dirs() {
+    local _d _p
+    for _d in "$RESULT_DIR"/run.*; do
+        [ -d "$_d" ] || continue
+        _p="${_d##*/run.}"
+        [ "$_p" = "$$" ] && continue
+        [ -d "/proc/$_p" ] && continue
+        rm -rf "$_d" 2>/dev/null
+    done
+    return 0
 }
 
 function read_config(){
@@ -234,10 +323,10 @@ function fetch_online_raw(){
     local src="${ip_online_url:-https://zip.cm.edu.kg/all.txt}"
     local timeout=30
     local min_lines="${CF_MIN_LINES:-50}"
-    local out_full="${RESULT_DIR}/ip_online_full.txt"
-    local out="${RESULT_DIR}/ip_online_raw.txt"
+    local out_full="${RUN_DIR}/ip_online_full.txt"
+    local out="${RUN_DIR}/ip_online_raw.txt"
     local tmp
-    tmp="$(mktemp "${RESULT_DIR}/ip_online.XXXXXX")" || { echolog "创建在线 IP 临时文件失败"; return 1; }
+    tmp="$(mktemp "${RUN_DIR}/ip_online.XXXXXX")" || { echolog "创建在线 IP 临时文件失败"; return 1; }
 
     echolog "下载在线 CM IP 列表(原始): $src"
     local ok=0 i
@@ -275,14 +364,14 @@ function fetch_online_raw(){
     return 0
 }
 
-# 按 listN 的 regions 从 ONLINE_RAW_FULL 过滤出该列表的候选 IP，写入 RESULT_DIR/ip_list_<N>.txt。
+# 按 listN 的 regions 从 ONLINE_RAW_FULL 过滤出该列表的候选 IP，写入 RUN_DIR/ip_list_<N>.txt。
 # regions 为空 = 全量 :443。不对过滤后文件再跑行数下限检查（窄国家可能合法 <50 行；
 # worker 自己的 [ $total -gt 0 ] 会处理空列表）。
 function build_ip_list_file(){
     local n="$1"
     local regions
     eval "regions=\${list${n}_regions:-}"
-    local out="${RESULT_DIR}/ip_list_${n}.txt"
+    local out="${RUN_DIR}/ip_list_${n}.txt"
     local full="${ONLINE_RAW_FULL:-}"
     [ -n "$full" ] && [ -f "$full" ] || { echolog "在线原始(带国家码)文件缺失，无法过滤 list${n}"; return 1; }
 
@@ -326,7 +415,11 @@ function select_ip_file(){
 }
 
 function speed_test(){
+    # 会话目录由运行锁建立（run_lock_acquire）；此处只做防御性检查，
+    # 避免 RUN_DIR 为空时中间状态落到根目录下。
+    [ -n "$RUN_DIR" ] || { echolog "内部错误：未持有运行锁就调用 speed_test，中止"; return 1; }
     # 日志只在整次测速入口处理一次：上次运行日志滚动归档为 .log.1~.log.5
+    # （须在拿到运行锁之后再轮转：否则被跳过的本次会把在跑会话的日志轮转走）
     rotate_log_files
     # 走节点测速：把候选 CF IP 写进 passwall 节点 address，用 passwall app.sh run_socks
     # 拉本地 SOCKS，curl -I 取 time_pretransfer 测延迟，多 worker 并行、多 probe fail-fast。
@@ -354,7 +447,7 @@ function speed_test(){
 # 后由 node_speed_test 的合并段一次性取各节点剩余通过集中的最优写回。
 function iterate_speed_test(){
     ITERATE_MODE=1
-    rm -f "${RESULT_DIR}/.iter_stop" "${RESULT_DIR}"/iterate_cand_* 2>/dev/null
+    # RUN_DIR 是本次新建的会话目录，不会残留上次运行的停止标志/收敛候选列表
     NT_ITER_DEADLINE=$(( $(date +%s) + iterate_minutes * 60 ))
     local started=$(date +%s)
     echolog "════ 限时迭代测速开始（时长上限 ${iterate_minutes} 分钟，各待测节点独立收敛）════"
@@ -387,7 +480,7 @@ NT_SNAPSHOT_REAPPLIED=0
 # 测前快照 /etc/config/passwall，测后还原以抹掉 passwall 在测速中途新增的异常节点段
 # （passwall 自身 restart/订阅刷新会偶发重建自带 socks 节点；脚本无法控制，靠整份快照兜底）。
 nt_snapshot() {
-    NT_SNAP_FILE="$(mktemp "${RESULT_DIR}/passwall_snap.XXXXXX")" || { echolog "创建 passwall 快照失败"; NT_SNAP_FILE=""; return 1; }
+    NT_SNAP_FILE="$(mktemp "${RUN_DIR}/passwall_snap.XXXXXX")" || { echolog "创建 passwall 快照失败"; NT_SNAP_FILE=""; return 1; }
     cp /etc/config/passwall "${NT_SNAP_FILE}" 2>/dev/null || { echolog "快照 /etc/config/passwall 失败"; rm -f "${NT_SNAP_FILE}"; NT_SNAP_FILE=""; return 1; }
 }
 
@@ -419,10 +512,23 @@ node_test_cleanup() {
     fi
     rm -f "${NT_SNAP_FILE}" "${NT_ORIG_FILE}" 2>/dev/null
     # 清理首完成即停用的完成标记、迭代轮次临时结果、轮次 meta 与停止标志（含中断退出残留）
-    rm -f "${RESULT_DIR}"/result.csv.tmp.*.done "${RESULT_DIR}"/result.csv.tmp.*.end "${RESULT_DIR}"/result.csv.tmp.*.pass "${RESULT_DIR}"/result.csv.tmp.*.meta "${RESULT_DIR}/.nt_stop" 2>/dev/null
+    rm -f "${RUN_DIR}"/result.csv.tmp.*.done "${RUN_DIR}"/result.csv.tmp.*.end "${RUN_DIR}"/result.csv.tmp.*.pass "${RUN_DIR}"/result.csv.tmp.*.meta "${RUN_DIR}/.nt_stop" 2>/dev/null
 }
 
-nt_lock_acquire() { while ! mkdir "${NT_LOCKDIR}" 2>/dev/null; do sleep 0.1; done; }
+# 锁目录在会话目录内，随会话创建/销毁；原实现是死循环等待，一旦残留就把整个会话卡死。
+nt_lock_acquire() {
+    local _i=0
+    while ! mkdir "${NT_LOCKDIR}" 2>/dev/null; do
+        _i=$((_i + 1))
+        if [ "$_i" -ge 300 ]; then
+            echolog "警告：uci 串行锁等待超 30s，强制接管（疑有 worker 僵死）"
+            rm -rf "${NT_LOCKDIR}" 2>/dev/null
+            mkdir "${NT_LOCKDIR}" 2>/dev/null
+            return 0
+        fi
+        sleep 0.1
+    done
+}
 nt_lock_release() { rmdir "${NT_LOCKDIR}" 2>/dev/null; }
 
 # 测速前切 passwall 全局 TCP 节点到稳定节点；还原由 node_test_cleanup 兜底。
@@ -458,7 +564,7 @@ nt_scan_running() {
     local _new="" _t _pid _w _rfile _stop=0
     for _t in $NT_RUNNING; do
         _pid="${_t%%:*}"; _w="${_t#*:}"
-        _rfile="${RESULT_DIR}/result.csv.tmp.$_w"
+        _rfile="${RUN_DIR}/result.csv.tmp.$_w"
         if [ -f "${_rfile}.done" ]; then
             _stop=1
             wait "$_pid" 2>/dev/null
@@ -565,7 +671,7 @@ node_test_worker() {
         [ -n "$_ip" ] || continue
         # 协作式提前停止：主循环首个有效结果完成后写 .nt_stop，本 worker 跑完当前 IP 即停
         log_size_guard
-        [ -f "${RESULT_DIR}/.nt_stop" ] && { echolog "worker [${_Wn}] 收到停止信号，跑完当前 IP 即停（已完成 ${_idx2}/${_total}）"; break; }
+        [ -f "${RUN_DIR}/.nt_stop" ] && { echolog "worker [${_Wn}] 收到停止信号，跑完当前 IP 即停（已完成 ${_idx2}/${_total}）"; break; }
         _idx2=$((_idx2 + 1))
         local _out _keep _sent _recv _loss _avg
         _out=$(nt_probe_one_ip "$_W" "$_ip" "$_purl" "$_tmo" "$_probes" "$_port" "$_flag")
@@ -613,7 +719,7 @@ iterate_log_final_summary(){
 }
 
 # 迭代模式 worker：每个待测节点一个独立收敛循环，直到 deadline 或停止标志。
-# 候选列表存 RESULT_DIR/iterate_cand_<节点>（该节点自己的临时待测 IP 列表）：
+# 候选列表存 RUN_DIR/iterate_cand_<节点>（该节点自己的临时待测 IP 列表）：
 #   第 1 轮 = 初始候选（$4），此后每轮只保留通过 IP（按延迟升序）作为下一轮候选，
 #   逐轮收敛出「最稳定基础上延迟最低」的集合。到点后留下的就是最稳的 IP。
 # 结果文件 $3 启动时先写表头（截断上次运行残留），每轮完成时原子覆盖（首行=该节点当前最优）；
@@ -624,7 +730,7 @@ iterate_log_final_summary(){
 # 参数: $1=idx $2=node $3=result_file $4=ip_list $5=probe_url $6=timeout $7=probes $8=socks_port $9=flag $10=deadline(epoch)
 node_iterate_worker() {
     local _idx=$1 _W=$2 _rfile=$3 _ips=$4 _purl=$5 _tmo=$6 _probes=$7 _port=$8 _flag=$9 _deadline=${10}
-    local _cand="${RESULT_DIR}/iterate_cand_${_W}"
+    local _cand="${RUN_DIR}/iterate_cand_${_W}"
     local _pass=0 _lastpass=0 _kept _ip _list _total _passfile
     # 日志用节点备注名（无 remarks 则回退节点 id）；uci -q get 直读配置，子 shell 可用
     local _Wn
@@ -649,8 +755,8 @@ node_iterate_worker() {
     rm -f "${_rfile}.meta" 2>/dev/null
     while :; do
         # 到点 / 用户停止（.nt_stop 与 .iter_stop 都查）→ 跑完当前判定即退
-        [ -f "${RESULT_DIR}/.nt_stop" ] && break
-        [ -f "${RESULT_DIR}/.iter_stop" ] && break
+        [ -f "${RUN_DIR}/.nt_stop" ] && break
+        [ -f "${RUN_DIR}/.iter_stop" ] && break
         [ "$(date +%s)" -ge "$_deadline" ] && break
         _pass=$((_pass + 1))
         _list=$(grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$_cand" 2>/dev/null)
@@ -662,8 +768,8 @@ node_iterate_worker() {
         printf '%s\n' "$_list" | while read -r _ip; do
             [ -n "$_ip" ] || continue
             log_size_guard
-            [ -f "${RESULT_DIR}/.nt_stop" ] && { echolog "迭代 [${_Wn}] 第 ${_pass} 轮收到停止信号，跑完当前 IP 即停"; break; }
-            [ -f "${RESULT_DIR}/.iter_stop" ] && break
+            [ -f "${RUN_DIR}/.nt_stop" ] && { echolog "迭代 [${_Wn}] 第 ${_pass} 轮收到停止信号，跑完当前 IP 即停"; break; }
+            [ -f "${RUN_DIR}/.iter_stop" ] && break
             [ "$(date +%s)" -ge "$_deadline" ] && { echolog "迭代 [${_Wn}] 到达时长上限，跑完当前 IP 即停"; break; }
             _idx2=$((_idx2 + 1))
             local _out _keep _sent _recv _loss _avg
@@ -783,7 +889,7 @@ node_speed_test() {
             local N
             N=$(resolve_node_list "$nodeid")
             if [ -n "$N" ]; then
-                src_file="${RESULT_DIR}/ip_list_${N#list}.txt"
+                src_file="${RUN_DIR}/ip_list_${N#list}.txt"
             else
                 src_file="${ONLINE_RAW:-}"   # 无启用列表 → 全量 :443 原始
             fi
@@ -814,8 +920,8 @@ node_speed_test() {
     if [ -n "$workers_raw" ]; then
         # ── 多节点并行路径 ──
         # 校验每个 worker，建 idx→node→origaddr 映射文件
-        NT_ORIG_FILE="$(mktemp "${RESULT_DIR}/node_test_orig.XXXXXX")" || { echolog "创建 worker 映射文件失败"; return 1; }
-        NT_LOCKDIR="${RESULT_DIR}/.node_test_lock"
+        NT_ORIG_FILE="$(mktemp "${RUN_DIR}/node_test_orig.XXXXXX")" || { echolog "创建 worker 映射文件失败"; return 1; }
+        NT_LOCKDIR="${RUN_DIR}/.node_test_lock"
         local valid_workers="" widx=0
         for _w in $workers_raw; do
             local wt wa
@@ -850,7 +956,7 @@ node_speed_test() {
             # worker，跳到合并阶段按已有（含被杀 worker 的部分）结果排序。无有效结果的
             # worker 完成（写 .end）仅释放并发槽，不触发停止。
             NT_RUNNING=""
-            rm -f "${RESULT_DIR}/.nt_stop" 2>/dev/null
+            rm -f "${RUN_DIR}/.nt_stop" 2>/dev/null
             local launched=0 _stop=0 _rfile _t _port _wips _wtot
             if [ "${ITERATE_MODE:-0}" = "1" ]; then
                 # ── 限时迭代：每个待测节点一个独立收敛循环 ──
@@ -860,7 +966,7 @@ node_speed_test() {
                 echolog "迭代模式：${widx} 个待测节点各跑独立收敛循环至时限，全部同时运行（并发上限不适用）"
                 for _w in $valid_workers; do
                     launched=$((launched + 1))
-                    _rfile="${RESULT_DIR}/result.csv.tmp.$_w"
+                    _rfile="${RUN_DIR}/result.csv.tmp.$_w"
                     rm -f "${_rfile}.done" "${_rfile}.end" "${_rfile}.pass" 2>/dev/null
                     # 端口确定性分配：48900 + idx - 1（每 worker 固定端口，复用于其所有 IP）
                     _port=$((48900 + launched - 1))
@@ -884,7 +990,7 @@ node_speed_test() {
                     done
                     [ "$_stop" = "1" ] && break
                     launched=$((launched + 1))
-                    _rfile="${RESULT_DIR}/result.csv.tmp.$_w"
+                    _rfile="${RUN_DIR}/result.csv.tmp.$_w"
                     rm -f "${_rfile}.done" "${_rfile}.end" 2>/dev/null
                     # 端口确定性分配：48900 + idx - 1（每 worker 固定端口，复用于其所有 IP）
                     _port=$((48900 + launched - 1))
@@ -904,23 +1010,23 @@ node_speed_test() {
                 # 提前停止：写停止标志，其余 worker 跑完当前 IP 自行 break 退出，wait 收尸（不 kill）
                 if [ "$_stop" = "1" ]; then
                     echolog "首个有效结果 worker 完成，其余 worker 跑完当前 IP 即停，按已有结果排序"
-                    : > "${RESULT_DIR}/.nt_stop"
+                    : > "${RUN_DIR}/.nt_stop"
                     wait  # 各 worker 自行 break → 写 .done/.end → 正常退出，wait 收尸
                 fi
             fi
             NT_RUNNING=""
             # 注意：这里不能删 result.csv.tmp.*.meta——合并段还要读它打逐节点最终结果；
             # .meta 由合并循环逐个删除（随 mwfile），中断残留由 node_test_cleanup 兜底
-            rm -f "${RESULT_DIR}"/result.csv.tmp.*.done "${RESULT_DIR}"/result.csv.tmp.*.end "${RESULT_DIR}"/result.csv.tmp.*.pass "${RESULT_DIR}/.nt_stop" 2>/dev/null
+            rm -f "${RUN_DIR}"/result.csv.tmp.*.done "${RUN_DIR}"/result.csv.tmp.*.end "${RUN_DIR}"/result.csv.tmp.*.pass "${RUN_DIR}/.nt_stop" 2>/dev/null
             # 各 worker 写回各自最优（串行，单进程无锁）
             local merged reapply
-            merged="$(mktemp "${RESULT_DIR}/result.csv.merged.XXXXXX")"
-            reapply="$(mktemp "${RESULT_DIR}/node_test_reapply.XXXXXX")"
+            merged="$(mktemp "${RUN_DIR}/result.csv.merged.XXXXXX")"
+            reapply="$(mktemp "${RUN_DIR}/node_test_reapply.XXXXXX")"
             echo "IP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码,节点" > "$merged"
             local mi mw morig mwfile mwbest
             while read -r mi mw morig; do
                 [ -n "$mw" ] || continue
-                mwfile="${RESULT_DIR}/result.csv.tmp.$mw"
+                mwfile="${RUN_DIR}/result.csv.tmp.$mw"
                 # 被杀 worker 的部分结果文件未经其自身排序；这里补排，使 first_result_ip
                 # 取到该 worker 最低延迟 IP 写回 passwall address。对已完成 worker 幂等。
                 sort_result "$mwfile" latency
@@ -1011,7 +1117,7 @@ node_speed_test() {
     echolog "开始走节点测速（单节点串行: ${NODE_TEST_NODE}, 候选: ${total}, 每IP探测 ${probes} 次, 超时 ${timeout}s）"
     echolog "提示：测速期间源节点 ${NODE_TEST_NODE} 的 address 会被反复改写，该节点会短暂抖动，测完写回最优 IP"
 
-    result_tmp="$(mktemp "${RESULT_DIR}/result.csv.tmp.XXXXXX")" || { echolog "创建临时测速结果文件失败"; return 1; }
+    result_tmp="$(mktemp "${RUN_DIR}/result.csv.tmp.XXXXXX")" || { echolog "创建临时测速结果文件失败"; return 1; }
     # inline 调用 worker 之前切 passwall TCP 节点到稳定节点（测后由 node_test_cleanup 还原）
     nt_switch_tcp_node || { echolog "稳定节点非法，中止"; node_test_cleanup; trap - EXIT INT TERM; return 1; }
     # 单节点：inline 调用 worker（不 background），端口 48900、flag=base
@@ -1257,8 +1363,17 @@ read_config
 
 # 启动参数
 if [ "$1" ] ;then
+    # 整跑入口的单实例锁：start/test/replace 都算一次完整运行。抢不到说明已有整跑在跑
+    # （定时任务重叠、UI 连点、SSH 手敲），直接退出——两套 worker 会抢同一批 passwall 节点
+    # 并互删中间状态，跑出来的结果是脏的。
+    case "$1" in
+        start|test|replace)
+            run_lock_acquire || { echolog "已有测速在运行（PID $(cat "$RUN_LOCK_DIR/pid" 2>/dev/null)），本次 $1 跳过"; exit 1; }
+            ;;
+    esac
     [ $1 == "start" ] && speed_test && ip_replace
     [ $1 == "test" ] && speed_test
     [ $1 == "replace" ] && ip_replace
+    run_lock_release
     exit
 fi

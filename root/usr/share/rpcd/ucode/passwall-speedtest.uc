@@ -4,7 +4,9 @@ const fs = require('fs');
 const uci = require('uci');
 
 const LOG_FILE = '/tmp/passwall-speedtest.log';
-const RESULT_FILE = '/tmp/passwall-speedtest/result.csv';
+const RESULT_DIR = '/tmp/passwall-speedtest';
+const RESULT_FILE = RESULT_DIR + '/result.csv';
+const RUN_PID_FILE = RESULT_DIR + '/current_run';
 const HISTORY_FILE = '/etc/passwall-speedtest/history.csv';
 const RUN_SCRIPT = '/usr/bin/passwall-speedtest/passwall-speedtest.sh';
 
@@ -137,10 +139,28 @@ function start() {
 	return {};
 }
 
+// 当前会话目录：脚本在整跑入口把主进程 PID 写进 current_run，本次运行的全部中间状态
+// （含 .nt_stop / .iter_stop 停止标志）都在 run.<PID>/ 下，多个整跑并发时互不干扰。
+// 取不到或不是纯数字（脚本未运行 / 旧版本把状态平铺在 RESULT_DIR）时回退到旧路径。
+function run_dir() {
+	let pid = '';
+
+	try {
+		pid = trim(read_file(RUN_PID_FILE) || '');
+	}
+	catch (e) {
+		pid = '';
+	}
+
+	return match(pid, /^[0-9]+$/) ? RESULT_DIR + '/run.' + pid : null;
+}
+
 function stop() {
-	// 协作式停止：写公共停止标志 .nt_stop，各 worker 跑完当前 IP 自行 break；
-	// 另写 .iter_stop（脚本内无人删除），限时迭代模式据此在轮间不再开新轮。
-	command('touch /tmp/passwall-speedtest/.nt_stop /tmp/passwall-speedtest/.iter_stop 2>/dev/null');
+	// 协作式停止：写本次会话的停止标志 .nt_stop，各 worker 跑完当前 IP 自行 break；
+	// 另写 .iter_stop，限时迭代模式据此在轮间不再开新轮。
+	let dir = run_dir() || RESULT_DIR;
+
+	command('touch ' + shquote(dir + '/.nt_stop') + ' ' + shquote(dir + '/.iter_stop') + ' 2>/dev/null');
 	// 兜底：给协作收尾足够时间（当前 IP 探测约 timeout×probes，默认 ~15s + 合并）；
 	// 仍未退出（卡在下载等非 worker 阶段或真挂死）则 SIGINT 触发 trap 清理还原，再 kill -9。
 	command('( sleep 20; pgrep -f "[p]asswall-speedtest\\.sh" | xargs kill -INT >/dev/null 2>&1; sleep 3; pgrep -f "[p]asswall-speedtest\\.sh" | xargs kill -9 >/dev/null 2>&1 ) >/dev/null 2>&1 &');

@@ -60,6 +60,8 @@ After a test completes:
 
 Built-in cron scheduling supports a 1–24 hour interval or a custom cron expression. The `init.d` script updates the crontab idempotently, only when it changes.
 
+Every full run takes a single-instance lock at its entry point: only one run at a time, and an overlapping trigger (duplicate cron firings, repeated UI clicks, manual SSH runs) is **skipped with one log line** instead of racing the running one over the same passwall nodes. A leftover lock from a killed process or a power loss is taken over automatically on the next run. When writing a custom cron expression, mind the minute field: `* 19 * * 4` means "every minute of hour 19 on Thursday" — use `0 19 * * 4` for a single run.
+
 ## Results & History
 
 Results are saved to `/tmp/passwall-speedtest/result.csv` with 10 rolling historical versions kept; the Best IP area shows the last 100 lines, and the latency chart plots the most recent 10 results.
