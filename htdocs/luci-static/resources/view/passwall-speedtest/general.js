@@ -407,7 +407,7 @@ return view.extend({
 		o.rmempty = false;
 
 		o = s.taboption('basic', form.Value, 'ip_online_url', _('Online source URL'),
-			_('Source list in <code>IP:PORT#country</code> format. Only :443 entries are kept. Shared by all 5 CM IP lists below.'));
+			_('Source list in <code>IP:PORT#country</code> format. Shared by all 5 CM IP lists below; each list keeps only its own port.'));
 		o.depends('ip_source', 'online');
 		o.default = 'https://zip.cm.edu.kg/all.txt';
 		o.rmempty = false;
@@ -540,10 +540,10 @@ return view.extend({
 		});
 		o.default = '24';
 
-		// ── 五个 CM 备选 IP 列表（共享 ip_online_url，仅国家筛选不同）──
+		// ── 五个 CM 备选 IP 列表（共享 ip_online_url，仅国家/端口筛选不同）──
 		// 始终渲染，通过 data-depends 联动 ip_source 动态显隐（见 m.render().then 中的 cbi_d_add 注册）。
 		s = m.section(form.TableSection, 'ip_list', _('CM IP lists (per-country)'),
-			_('Define up to 5 CM-source IP lists. All share the online URL above; each filters by its own country set. Assign one list per passwall worker node in the Third-Party tab. Workers without an explicit list use the first enabled list. Only used when IP list source = Online CM source.'));
+			_('Define up to 5 CM-source IP lists. All share the online URL above; each filters by its own country set and port. Assign one list per passwall worker node in the Third-Party tab. Workers without an explicit list use the first enabled list. Only used when IP list source = Online CM source. Note: the port only picks the candidates — the port actually probed is the worker node\'s own port, so set the node to the same port.'));
 		s.addremove = false;
 		s.anonymous = false;
 		s.nodescriptions = true;
@@ -556,7 +556,7 @@ return view.extend({
 		o.rmempty = true;
 
 		o = s.option(form.MultiValue, 'regions', _('Country filter'),
-			_('Only keep :443 IPs tagged with the selected countries. Leave none selected to keep all :443 IPs.'));
+			_('Only keep IPs tagged with the selected countries. Leave none selected to keep every country on this port.'));
 		o.value('JP', _('Japan'));
 		o.value('SG', _('Singapore'));
 		o.value('KR', _('South Korea'));
@@ -585,6 +585,12 @@ return view.extend({
 		o.value('AU', _('Australia'));
 		o.value('AE', _('United Arab Emirates'));
 		o.value('ZA', _('South Africa'));
+
+		o = s.option(form.Value, 'port', _('Port'),
+			_('Keep only source entries on this port (Cloudflare serves 443 / 8443 / 2053 / 2083 / 2087 / 2096). Default 443.'));
+		o.datatype = 'port';
+		o.default = '443';
+		o.rmempty = false;
 
 		s = m.section(form.NamedSection, 'global', 'global', _('Best IP'));
 		s.addremove = false;

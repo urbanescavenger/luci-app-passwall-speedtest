@@ -152,14 +152,23 @@ msgstr "在线 CM 源"
 msgid "Online source URL"
 msgstr "在线源 URL"
 
-msgid "Source list in <code>IP:PORT#country</code> format. Only :443 entries are kept."
-msgstr "源列表格式为 <code>IP:端口#国家</code>；只保留 :443 条目。"
+msgid "Source list in <code>IP:PORT#country</code> format. Shared by all 5 CM IP lists below; each list keeps only its own port."
+msgstr "源列表格式为 <code>IP:端口#国家</code>；下方 5 个 CM IP 列表共用此源，各自只保留自己配置的端口。"
 
 msgid "Country filter"
 msgstr "国家过滤"
 
-msgid "Only keep :443 IPs tagged with the selected countries. Leave none selected to keep all :443 IPs. Default JP/SG/KR for mainland reverse-proxy optimization."
-msgstr "只保留标了所选国家且为 :443 的 IP；不勾选任何国家则保留全部 :443。默认 JP/SG/KR（大陆反代优选）。"
+msgid "Only keep IPs tagged with the selected countries. Leave none selected to keep every country on this port."
+msgstr "只保留标了所选国家的 IP；不勾选任何国家则该端口下所有国家都保留。"
+
+msgid "Port"
+msgstr "端口"
+
+msgid "Keep only source entries on this port (Cloudflare serves 443 / 8443 / 2053 / 2083 / 2087 / 2096). Default 443."
+msgstr "只保留源里该端口的条目（Cloudflare 常见 443 / 8443 / 2053 / 2083 / 2087 / 2096），默认 443。"
+
+msgid "Define up to 5 CM-source IP lists. All share the online URL above; each filters by its own country set and port. Assign one list per passwall worker node in the Third-Party tab. Workers without an explicit list use the first enabled list. Only used when IP list source = Online CM source. Note: the port only picks the candidates — the port actually probed is the worker node's own port, so set the node to the same port."
+msgstr "最多定义 5 个 CM 源 IP 列表，共用上面的在线源 URL，各自按自己的国家集合与端口筛选。在「第三方设置」里给每个 passwall worker 节点指派一个列表；未指派的节点回退到第一个启用的列表。仅在「IP 列表来源 = 在线 CM 源」时生效。注意：这里的端口只用于挑候选 IP，真正探测用的端口是 worker 节点自身的 port，请把节点端口设为同一个。"
 
 msgid "Japan"
 msgstr "日本"

@@ -130,6 +130,7 @@ function read_config(){
         eval "list${_n}_enabled=\$(uci get passwall-speedtest.list${_n}.enabled 2>/dev/null)"
         eval "list${_n}_name=\$(uci get passwall-speedtest.list${_n}.name 2>/dev/null)"
         eval "list${_n}_regions=\$(uci get passwall-speedtest.list${_n}.regions 2>/dev/null)"
+        eval "list${_n}_port=\$(uci get passwall-speedtest.list${_n}.port 2>/dev/null)"
     done
 }
 
@@ -309,10 +310,12 @@ function sort_result(){
 }
 
 # 从在线 CM 源下载原始候选列表。源格式: IP:PORT#国家码 (如 1.2.3.4:443#JP)
-# 只保留 :443# 行。输出两份：
-#   ONLINE_RAW_FULL = 带国家码的 :443#CC 行（去重），供 build_ip_list_file 按国家过滤；
-#   ONLINE_RAW      = 去端口去重的纯 IP，用于 sanity 校验（行数下限、格式占比）。
-# 国家码白名单过滤由 build_ip_list_file 按各 ip_list 的 regions 分别做（一次下载、多次过滤）。
+# 输出两份：
+#   ONLINE_RAW_FULL = 全部端口的 IP:PORT#CC 行（去重），供 build_ip_list_file 按各列表的
+#                     端口 + 国家过滤（源里通常只有 CF 的 443/8443/2053/2083/2087/2096）；
+#   ONLINE_RAW      = 仅 :443、去端口去重的纯 IP，用于 sanity 校验（行数下限、格式占比），
+#                     同时作为「无启用列表」时的兜底候选（语义与引入端口过滤前一致）。
+# 端口/国家白名单过滤由 build_ip_list_file 按各 ip_list 分别做（一次下载、多次过滤）。
 # 带下载重试、空检查、行数下限、格式校验(参考仓库根 update_cf_ip.sh)。
 # 注意:本函数会被 node_speed_test 直接调用(不在 $(...) 内),故 echolog 的 stdout 日志安全；
 # 路径不通过 echo 返回,避免被 command substitution 捕获日志行污染变量。
@@ -337,10 +340,10 @@ function fetch_online_raw(){
     [ "$ok" = 1 ] || { echolog "下载失败(重试 3 次): $src"; rm -f "$tmp"; return 1; }
     [ -s "$tmp" ] || { echolog "下载内容为空"; rm -f "$tmp"; return 1; }
 
-    # 带国家码的 :443# 行（去重）→ ONLINE_RAW_FULL
-    { grep ':443#' "$tmp" | sort -u || true; } > "${out_full}.tmp"
-    # 去端口去重的纯 IP → 用于 sanity 校验
-    { sed 's/:.*//' "${out_full}.tmp" | sort -u || true; } > "${out}.tmp"
+    # 全端口的 IP:PORT#CC 行（去重）→ ONLINE_RAW_FULL，供各列表按端口 + 国家过滤
+    { grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+#' "$tmp" | sort -u || true; } > "${out_full}.tmp"
+    # 仅 :443 去端口去重的纯 IP → sanity 校验 + 无启用列表时的兜底（与端口过滤引入前一致）
+    { grep ':443#' "${out_full}.tmp" | sed 's/:.*//' | sort -u || true; } > "${out}.tmp"
 
     local lines good
     lines=$(wc -l < "${out}.tmp" | tr -d ' ')
@@ -355,22 +358,28 @@ function fetch_online_raw(){
     fi
 
     mkdir -p "$RESULT_DIR"
+    local full_lines
+    full_lines=$(wc -l < "${out_full}.tmp" | tr -d ' ')
     mv -f "${out_full}.tmp" "$out_full"
     mv -f "${out}.tmp" "$out"
     rm -f "$tmp"
     ONLINE_RAW_FULL="$out_full"
     ONLINE_RAW="$out"
-    echolog "在线 CM 原始列表就绪: $lines 行 -> $out (带国家码: $out_full)"
+    echolog "在线 CM 原始列表就绪: 全端口 $full_lines 行 -> $out_full (其中 :443 纯 IP $lines 个 -> $out)"
     return 0
 }
 
-# 按 listN 的 regions 从 ONLINE_RAW_FULL 过滤出该列表的候选 IP，写入 RUN_DIR/ip_list_<N>.txt。
-# regions 为空 = 全量 :443。不对过滤后文件再跑行数下限检查（窄国家可能合法 <50 行；
+# 按 listN 的 端口 + regions 从 ONLINE_RAW_FULL 过滤出该列表的候选 IP，写入 RUN_DIR/ip_list_<N>.txt。
+# 端口取 listN.port（默认 443，非法值同默认）；regions 为空 = 该端口全部国家。
+# 不对过滤后文件再跑行数下限检查（窄国家/冷门端口可能合法 <50 行；
 # worker 自己的 [ $total -gt 0 ] 会处理空列表）。
 function build_ip_list_file(){
     local n="$1"
-    local regions
+    local regions _port
     eval "regions=\${list${n}_regions:-}"
+    eval "_port=\${list${n}_port:-}"
+    case "$_port" in ''|*[!0-9]*) _port=443 ;; esac
+    [ "$_port" -ge 1 ] 2>/dev/null && [ "$_port" -le 65535 ] 2>/dev/null || _port=443
     local out="${RUN_DIR}/ip_list_${n}.txt"
     local full="${ONLINE_RAW_FULL:-}"
     [ -n "$full" ] && [ -f "$full" ] || { echolog "在线原始(带国家码)文件缺失，无法过滤 list${n}"; return 1; }
@@ -378,13 +387,13 @@ function build_ip_list_file(){
     if [ -n "$regions" ]; then
         local re
         re=$(printf '%s' "$regions" | sed 's/[[:space:],]/|/g')
-        { grep -E ":443#($re)$" "$full" | sed 's/:.*//' | sort -u || true; } > "$out"
+        { grep -E ":${_port}#($re)$" "$full" | sed 's/:.*//' | sort -u || true; } > "$out"
     else
-        { sed 's/:.*//' "$full" | sort -u || true; } > "$out"
+        { grep -E ":${_port}#" "$full" | sed 's/:.*//' | sort -u || true; } > "$out"
     fi
     local lines
     lines=$(wc -l < "$out" | tr -d ' ')
-    echolog "CM IP 列表 list${n} 就绪: ${lines} 行 (regions: ${regions:-全量 :443}) -> $out"
+    echolog "CM IP 列表 list${n} 就绪: ${lines} 行 (端口 ${_port}, regions: ${regions:-全部}) -> $out"
     return 0
 }
 
