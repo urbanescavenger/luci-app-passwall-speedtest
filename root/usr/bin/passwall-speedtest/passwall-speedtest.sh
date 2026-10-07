@@ -481,6 +481,7 @@ NODE_TEST_ORIG_ADDR=""
 NODE_TEST_DONE=0
 NT_LOCKDIR=""
 NT_ORIG_FILE=""
+NT_ORIG_NODE=""
 NT_ORIG_TCP_NODE=""
 NT_TCP_SWITCHED=0
 NT_SNAP_FILE=""
@@ -515,7 +516,7 @@ node_test_cleanup() {
     fi
     rmdir "${NT_LOCKDIR}" 2>/dev/null
     # 成功路径已由 success 代码自行「还原快照 + 重放 address + restart」并置
-    # NT_SNAPSHOT_REAPPLIED=1，此处跳过；失败/中断/结果为空路径走整份回滚（含 address 与 tcp_node）。
+    # NT_SNAPSHOT_REAPPLIED=1，此处跳过；失败/中断/结果为空路径走整份回滚（含 address 与全局节点 node/tcp_node）。
     if [ "${NT_SNAPSHOT_REAPPLIED:-0}" != "1" ]; then
         nt_rollback
     fi
@@ -540,26 +541,38 @@ nt_lock_acquire() {
 }
 nt_lock_release() { rmdir "${NT_LOCKDIR}" 2>/dev/null; }
 
-# 测速前切 passwall 全局 TCP 节点到稳定节点；还原由 node_test_cleanup 兜底。
-# tcp_node 变更需 /etc/init.d/passwall restart 才能实时生效；切换在拉起 worker 之前、
+# 测速前把 passwall 全局主节点切到稳定节点；还原由 node_test_cleanup 兜底。
+# 节点变更需 /etc/init.d/passwall restart 才能实时生效；切换在拉起 worker 之前、
 # 还原在所有 worker 结束之后，故 restart 不与 worker 的 app.sh run_socks 并发。
 # 调用前须已通过必填与冲突校验（stable_node 非空且不在待测集合内）。
-# 返回 1 = 稳定节点非法（不存在或为 socks 类型，与待测节点禁 socks 的校验对称），调用方应中止。
+# 返回 1 = 稳定节点不存在（无 type），调用方应中止。
 nt_switch_tcp_node() {
     local _s="${stable_node:-}"
     [ -n "$_s" ] || return 0
-    # 稳定节点须存在且非 socks（其 address 即 SOCKS 服务器，作全局 TCP 出口意义不符）
+    # 稳定节点须存在。不再拒绝 socks 型：passwall 的 app.sh get_config() 明确接受
+    # nodes 与 socks 两型作全局节点（本地负载均衡入口如 127.0.0.1:1181 正是 socks 型，
+    # 也是官方分流节点的 default_node 常指目标）；它不参与测速、address 不会被改写。
     local _st
     _st=$(config_n_get "$_s" type)
     [ -n "$_st" ] || { echolog "稳定节点 ${_s} 不存在或无 type，中止"; return 1; }
-    case "$(echo "$_st" | tr 'A-Z' 'a-z')" in socks) echolog "稳定节点 ${_s} 是 SOCKS 类型，中止（稳定节点须为 CF-CDN 前置代理）"; return 1 ;; esac
+    # passwall 26.10.x 起全局主节点键由 tcp_node 迁到 node：app.sh get_config() 读
+    # @global[0].node，tcp_node 只剩 footer.htm 显示用（那里的 tcp_node|udp_node 正则
+    # 已被注释掉、换成 node.main）。老版本读 tcp_node。故两键同写，谁生效由所装版本
+    # 决定；还原统一走测前快照（成功路径 cp 快照 / 失败路径 nt_rollback），不逐键回滚。
+    NT_ORIG_NODE="$(uci -q get passwall.@global[0].node 2>/dev/null)"
     NT_ORIG_TCP_NODE="$(uci -q get passwall.@global[0].tcp_node 2>/dev/null)"
-    # 已是稳定节点则无需切换（也不置 SWITCHED，cleanup 跳过还原）
-    [ "$_s" = "$NT_ORIG_TCP_NODE" ] && { NT_ORIG_TCP_NODE=""; NT_TCP_SWITCHED=0; return 0; }
-    echolog "切换 passwall TCP 节点到稳定节点 ${_s}（测速期间保护实流量）"
+    # 生效键已是稳定节点则无需切换（也不置 SWITCHED，cleanup 跳过还原）：node 优先，空则回落 tcp_node
+    local _eff="${NT_ORIG_NODE:-$NT_ORIG_TCP_NODE}"
+    [ "$_eff" = "$_s" ] && { NT_ORIG_NODE=""; NT_ORIG_TCP_NODE=""; NT_TCP_SWITCHED=0; return 0; }
+    local _warn=""
+    if [ -n "$NT_ORIG_NODE" ] && [ "$(config_n_get "$NT_ORIG_NODE" protocol)" = "_shunt" ]; then
+        _warn="；原主节点 ${NT_ORIG_NODE} 是分流节点，测速期间分流规则暂停、流量全走稳定节点"
+    fi
+    echolog "切换 passwall 全局节点到稳定节点 ${_s}（原 node=${NT_ORIG_NODE:-无} / tcp_node=${NT_ORIG_TCP_NODE:-无}）${_warn}"
+    uci set passwall.@global[0].node="${_s}"
     uci set passwall.@global[0].tcp_node="${_s}"
     uci commit passwall
-    /etc/init.d/passwall restart >/dev/null 2>&1 || echolog "警告：passwall restart 失败，TCP 节点切换可能未实时生效"
+    /etc/init.d/passwall restart >/dev/null 2>&1 || echolog "警告：passwall restart 失败，节点切换可能未实时生效"
     NT_TCP_SWITCHED=1
 }
 
@@ -836,7 +849,7 @@ node_speed_test() {
     # 校验 passwall 已安装
     [ -f /usr/share/passwall/app.sh ] || { echolog "未安装 passwall，无法使用走节点测速"; return 1; }
     [ -f /usr/share/passwall/utils.sh ] || { echolog "缺少 passwall utils.sh，无法使用走节点测速"; return 1; }
-    # 必选项：稳定节点（测速期间把 passwall 全局 TCP 节点切到它，测后还原）
+    # 必选项：稳定节点（测速期间把 passwall 全局节点切到它，测后由快照还原）
     [ -n "${stable_node:-}" ] || { echolog "未配置「稳定节点」（必选项），中止走节点测速"; return 1; }
     # passwall 的 utils.sh 会覆盖 LOG_FILE 与 echolog()，先保存再恢复，避免日志写进 passwall 的日志文件
     local _pws_log_file="$LOG_FILE"
@@ -958,8 +971,8 @@ node_speed_test() {
             case " $valid_workers " in *" ${stable_node} "*) echolog "稳定节点 ${stable_node} 与待测 worker 重叠，中止（稳定节点不得在待测集合内）"; return 1 ;; esac
             # 测前快照 /etc/config/passwall：测后还原以抹掉 passwall 测速中途新增的异常节点段
             nt_snapshot || { echolog "passwall 快照失败，中止"; return 1; }
-            # 拉起 worker 之前切 passwall TCP 节点到稳定节点（测后由 node_test_cleanup 还原）
-            nt_switch_tcp_node || { echolog "稳定节点非法，中止"; node_test_cleanup; trap - EXIT INT TERM; return 1; }
+            # 拉起 worker 之前切 passwall 全局节点到稳定节点（测后由 node_test_cleanup 还原）
+            nt_switch_tcp_node || { echolog "稳定节点校验失败，中止"; node_test_cleanup; trap - EXIT INT TERM; return 1; }
             # 并发上限 + 首个有效结果即停：维持 threads 个并发，轮询各 worker 完成标记；
             # 任一 worker 跑完全部候选 IP 且保留≥1 个有效 IP（写 .done）时，立即终止其余
             # worker，跳到合并阶段按已有（含被杀 worker 的部分）结果排序。无有效结果的
@@ -1072,8 +1085,8 @@ node_speed_test() {
             mv -f "$merged" "$IP_FILE"
             bestip=$(first_result_ip "$IP_FILE")
             # ── 还原快照 → 抹掉 passwall 测速中途新增的异常节点段，再只重放本次应有的 address ──
-            # tcp_node 在快照里就是测前原值，cp 还原即已还原；一次 restart 同时让各 worker 最优
-            # IP + 原始 tcp_node 生效。
+            # 全局节点键（node / tcp_node）在快照里就是测前原值，cp 还原即已还原；一次 restart
+            # 同时让各 worker 最优 IP + 原始全局节点生效。
             if [ -n "${NT_SNAP_FILE}" ] && [ -f "${NT_SNAP_FILE}" ]; then
                 cp "${NT_SNAP_FILE}" /etc/config/passwall 2>/dev/null || echolog "警告：还原快照失败"
                 while read -r mw mbest; do
@@ -1127,8 +1140,8 @@ node_speed_test() {
     echolog "提示：测速期间源节点 ${NODE_TEST_NODE} 的 address 会被反复改写，该节点会短暂抖动，测完写回最优 IP"
 
     result_tmp="$(mktemp "${RUN_DIR}/result.csv.tmp.XXXXXX")" || { echolog "创建临时测速结果文件失败"; return 1; }
-    # inline 调用 worker 之前切 passwall TCP 节点到稳定节点（测后由 node_test_cleanup 还原）
-    nt_switch_tcp_node || { echolog "稳定节点非法，中止"; node_test_cleanup; trap - EXIT INT TERM; return 1; }
+    # inline 调用 worker 之前切 passwall 全局节点到稳定节点（测后由 node_test_cleanup 还原）
+    nt_switch_tcp_node || { echolog "稳定节点校验失败，中止"; node_test_cleanup; trap - EXIT INT TERM; return 1; }
     # 单节点：inline 调用 worker（不 background），端口 48900、flag=base
     if [ "${ITERATE_MODE:-0}" = "1" ]; then
         # 限时迭代：该节点跑独立收敛循环到时限，结果文件同路径，末尾统一合并写回（仅一次）

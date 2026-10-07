@@ -10,11 +10,19 @@ const callListNodes = rpc.declare({
 	expect: {}
 });
 
+// passwall/passwall2 的 socks 型节点（本地负载均衡入口等）列出来但标注不能作 worker——
+// 测速要把候选 IP 写进节点 address，socks 节点的 address 就是 SOCKS 服务器本身，改写即失效。
+// 脚本侧仍会跳过它们（见 node_speed_test 的 socks 校验），这里只是别让列表看起来"缺节点"。
+function markSocks(n) {
+	const socks = String(n.type || '').toLowerCase() === 'socks';
+	return socks ? '%s (%s)'.format(n.label, _('Socks — cannot be tested through')) : n.label;
+}
+
 function addNodeValues(option, nodes) {
 	nodes = nodes || [];
 
 	for (let i = 0; i < nodes.length; i++)
-		option.value(nodes[i].value, nodes[i].label);
+		option.value(nodes[i].value, markSocks(nodes[i]));
 }
 
 function tableCss() {

@@ -281,8 +281,14 @@ msgstr "当 IP 列表来源使用自定义文件时，必须填写自定义 IP �
 msgid "Passwall node to test through (single-node fallback)"
 msgstr "用于测速的 passwall 节点（单节点回退）"
 
-msgid "Used only when no passwall workers are selected in the Third-Party tab. Select a CF-CDN-fronted passwall node (VLESS/VMess/Trojan/SS…). Its <em>address</em> will be cycled through candidate IPs and finally set to the fastest one. SOCKS-type nodes are not supported."
-msgstr "仅在「第三方设置」里未选 passwall worker 时使用。选择一个 CF-CDN 前置的 passwall 节点（VLESS/VMess/Trojan/SS…），其 <em>address</em> 会被候选 IP 轮换，最终设为最快 IP。不支持 SOCKS 类型节点。"
+msgid "Used only when no passwall workers are selected in the Third-Party tab. Select a CF-CDN-fronted passwall node (VLESS/VMess/Trojan/SS…). Its <em>address</em> will be cycled through candidate IPs and finally set to the fastest one. SOCKS-type nodes (e.g. a local load-balance entry) are listed but cannot be tested through — their <em>address</em> is the SOCKS server itself."
+msgstr "仅在「第三方设置」里未选 passwall worker 时使用。选择一个 CF-CDN 前置的 passwall 节点（VLESS/VMess/Trojan/SS…），其 <em>address</em> 会被候选 IP 轮换，最终设为最快 IP。SOCKS 类型节点（例如本地负载均衡入口）仍会列出，但不能用于测速——它的 <em>address</em> 就是 SOCKS 服务器本身。"
+
+msgid "Socks — cannot be tested through"
+msgstr "Socks 类型，不能用于测速"
+
+msgid "During a speed test, passwall's global node is temporarily switched to this stable node and restored afterwards, so your live traffic is unaffected by the tested nodes' <em>address</em> being rewritten. <strong>Required.</strong> Must NOT equal the tested node (single-node fallback) or any selected passwall worker node. If your current global node is a shunt (分流) node, its shunt rules are suspended for the duration of the test and all traffic goes through this stable node."
+msgstr "测速期间 passwall 的全局节点会临时切到该稳定节点，测速结束后还原，使你的实流量不受被测节点 <em>address</em> 被改写的影响。<strong>必填。</strong>不得与被测节点（单节点回退）或任何已选 passwall worker 节点相同。若你当前的全局节点是分流（shunt）节点，测速期间其分流规则会暂停，全部流量走该稳定节点。"
 
 msgid "Probe URL"
 msgstr "探测 URL"

@@ -116,6 +116,14 @@ function tableCss() {
 `);
 }
 
+// passwall 节点下拉的标签：socks 型（本地负载均衡入口等）列出来但标注不能被测——
+// 脚本要把候选 IP 写进节点 address，而 socks 节点的 address 就是 SOCKS 服务器本身，
+// 改写即失效。此前是直接从下拉里滤掉，用户会误以为"节点显示不全"。
+function markSocks(n) {
+	const socks = String(n.type || '').toLowerCase() === 'socks';
+	return socks ? '%s (%s)'.format(n.label, _('Socks — cannot be tested through')) : n.label;
+}
+
 return view.extend({
 	load: function() {
 		return Promise.all([
@@ -450,15 +458,15 @@ return view.extend({
 		o.rmempty = false;
 
 		o = s.taboption('basic', form.ListValue, 'node_test_node', _('Passwall node to test through (single-node fallback)'),
-			_('Used only when no passwall workers are selected in the Third-Party tab. Select a CF-CDN-fronted passwall node (VLESS/VMess/Trojan/SS…). Its <em>address</em> will be cycled through candidate IPs and finally set to the fastest one. SOCKS-type nodes are not supported.'));
+			_('Used only when no passwall workers are selected in the Third-Party tab. Select a CF-CDN-fronted passwall node (VLESS/VMess/Trojan/SS…). Its <em>address</em> will be cycled through candidate IPs and finally set to the fastest one. SOCKS-type nodes (e.g. a local load-balance entry) are listed but cannot be tested through — their <em>address</em> is the SOCKS server itself.'));
 		o.value('', _('-- Please choose --'));
-		passwallNodes.forEach(function(n) { if (String(n.type || '').toLowerCase() !== 'socks') o.value(n.value, n.label); });
+		passwallNodes.forEach(function(n) { o.value(n.value, markSocks(n)); });
 		o.rmempty = true;
 
 		o = s.taboption('basic', form.ListValue, 'stable_node', _('Passwall stable node (required)'),
-			_('During a speed test, passwall\'s global TCP node is temporarily switched to this stable node and restored afterwards, so your live traffic is unaffected by the tested nodes\' <em>address</em> being rewritten. <strong>Required.</strong> Must NOT equal the tested node (single-node fallback) or any selected passwall worker node.'));
+			_('During a speed test, passwall\'s global node is temporarily switched to this stable node and restored afterwards, so your live traffic is unaffected by the tested nodes\' <em>address</em> being rewritten. <strong>Required.</strong> Must NOT equal the tested node (single-node fallback) or any selected passwall worker node. If your current global node is a shunt (分流) node, its shunt rules are suspended for the duration of the test and all traffic goes through this stable node.'));
 		o.value('', _('-- Please choose --'));
-		passwallNodes.forEach(function(n) { if (String(n.type || '').toLowerCase() !== 'socks') o.value(n.value, n.label); });
+		passwallNodes.forEach(function(n) { o.value(n.value, n.label); });
 		o.rmempty = false;
 		o.validate = function(section_id, value) {
 			if (!value || !value.length) return _('Please choose a stable node');
