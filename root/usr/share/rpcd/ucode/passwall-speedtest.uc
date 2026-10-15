@@ -139,10 +139,16 @@ function start() {
 	return {};
 }
 
-// 当前会话目录：脚本在整跑入口把主进程 PID 写进 current_run，本次运行的全部中间状态
-// （含 .nt_stop / .iter_stop 停止标志）都在 run.<PID>/ 下，多个整跑并发时互不干扰。
-// 取不到或不是纯数字（脚本未运行 / 旧版本把状态平铺在 RESULT_DIR）时回退到旧路径。
-function run_dir() {
+// 记录的主进程 PID 是否还活着、且确实是本脚本。只看 /proc/<pid> 存在会被「PID 被无关进程
+// 复用」骗过（同脚本 run_lock_acquire 的判据），故再匹配一次 cmdline。
+function run_pid_alive(pid) {
+	return command('[ -d /proc/' + pid + ' ] && grep -q "passwall-speedtest\\.sh" /proc/' + pid + '/cmdline 2>/dev/null').code == 0;
+}
+
+// 本次运行的主进程 PID：脚本在整跑入口把 PID 写进 current_run。取不到、不是纯数字、
+// 或进程已不在（上一次运行被强杀留下的 current_run）时返回 null —— 死 PID 的会话目录
+// 不能当成本次会话，否则停止标志会写进没人看的目录。
+function run_pid() {
 	let pid = '';
 
 	try {
@@ -152,18 +158,40 @@ function run_dir() {
 		pid = '';
 	}
 
-	return match(pid, /^[0-9]+$/) ? RESULT_DIR + '/run.' + pid : null;
+	return (match(pid, /^[0-9]+$/) && run_pid_alive(pid)) ? pid : null;
 }
 
+// 当前会话目录：本次运行的全部中间状态（含 .nt_stop / .iter_stop 停止标志）都在 run.<PID>/ 下，
+// 多个整跑并发时互不干扰。取不到（脚本未运行 / 旧版本把状态平铺在 RESULT_DIR）时返回 null。
+function run_dir() {
+	let pid = run_pid();
+
+	return pid ? RESULT_DIR + '/run.' + pid : null;
+}
+
+// 协作式停止：写本次会话的停止标志 .nt_stop，各 worker 跑完当前 IP 自行 break；
+// 另写 .iter_stop，限时迭代模式据此在轮间不再开新轮。
+// 停止的语义是「停止测速，但把已测到的各节点最优 IP 写完再退」：脚本收尾要还原测前快照、
+// 原子写回配置、再重启 passwall 才生效，而 passwall 的 restart 会在自己的锁上等最多 600s，
+// 所以这里不按固定秒数强杀：进程还活着就一直等；只有没进提交阶段（无 .nt_committing）且
+// 长时间不动（真挂死，~120s）才升级信号；进了提交阶段则放宽到 ~1200s 才兜底。
+// 强杀只针对记录的 PID 本身，不再 pgrep 通杀 —— 否则会误杀随后新起的那次运行。
 function stop() {
-	// 协作式停止：写本次会话的停止标志 .nt_stop，各 worker 跑完当前 IP 自行 break；
-	// 另写 .iter_stop，限时迭代模式据此在轮间不再开新轮。
-	let dir = run_dir() || RESULT_DIR;
+	let dir = run_dir();
+	let pid = run_pid();
+
+	if (dir == null || pid == null)
+		return {};
 
 	command('touch ' + shquote(dir + '/.nt_stop') + ' ' + shquote(dir + '/.iter_stop') + ' 2>/dev/null');
-	// 兜底：给协作收尾足够时间（当前 IP 探测约 timeout×probes，默认 ~15s + 合并）；
-	// 仍未退出（卡在下载等非 worker 阶段或真挂死）则 SIGINT 触发 trap 清理还原，再 kill -9。
-	command('( sleep 20; pgrep -f "[p]asswall-speedtest\\.sh" | xargs kill -INT >/dev/null 2>&1; sleep 3; pgrep -f "[p]asswall-speedtest\\.sh" | xargs kill -9 >/dev/null 2>&1 ) >/dev/null 2>&1 &');
+	command('( _w=0; while kill -0 ' + pid + ' 2>/dev/null; do' +
+		' if [ -f ' + shquote(dir + '/.nt_committing') + ' ]; then [ "$_w" -ge 1200 ] && break; else [ "$_w" -ge 120 ] && break; fi;' +
+		' sleep 3; _w=$((_w + 3));' +
+		' done;' +
+		' kill -0 ' + pid + ' 2>/dev/null || exit 0;' +
+		' kill -INT ' + pid + ' 2>/dev/null;' +
+		' sleep 15;' +
+		' kill -9 ' + pid + ' 2>/dev/null ) >/dev/null 2>&1 &');
 
 	return {};
 }

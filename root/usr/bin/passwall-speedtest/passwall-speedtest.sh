@@ -497,9 +497,99 @@ nt_snapshot() {
 # 整份还原快照（不重放任何 address）：用于失败/中断/结果为空路径，回滚本次测速所有改动。
 nt_rollback() {
     [ -n "${NT_SNAP_FILE}" ] && [ -f "${NT_SNAP_FILE}" ] || return 0
+    # 直写文件前先丢掉残留的 session delta（worker 被 kill 在 uci set 与 commit 之间会留下），
+    # 否则之后任何 uci commit 都会把陈旧 address 刷回文件，破坏这份刚还原的快照
+    uci -q revert passwall 2>/dev/null
     cp "${NT_SNAP_FILE}" /etc/config/passwall 2>/dev/null || echolog "警告：还原 passwall 快照失败"
     /etc/init.d/passwall restart >/dev/null 2>&1 || echolog "警告：passwall restart 失败，回滚可能未实时生效"
     echolog "已还原 passwall 配置到测速前快照（回滚本次测速所有改动，清理中途新增的异常节点）"
+}
+
+# 把各 worker 最优 IP 一次性写进 /etc/config/passwall：以测前快照为底，只替换/补写各 worker
+# 段（config nodes/socks '<id>'）里的 option address，其余行原样输出（文件含凭据，格式绝不改），
+# 先写同目录临时文件再 mv 覆盖 —— 同目录 rename 是原子的，所以任何时刻被 kill -9，配置要么是
+# 测前快照、要么是完整结果，不会再留下「一部分节点写了新 IP、一部分还是旧 IP」的半成品
+# （历史事故：停止时进程被杀在 `cp 快照` 与逐节点 `uci set` 之间，5 个节点只写进 2 个）。
+# 直写文件绕过了 uci，故写前必须 uci revert 丢掉可能残留的 session delta：否则之后任何
+# uci commit（我们自己的、或 passwall 自身的 uci -q commit passwall）都会把陈旧 delta
+# 刷回文件，覆盖掉刚写的 IP。
+# 参数: $1 = reapply 文件（每行 node<TAB>最优IP）
+# 返回 0 = 已按预期落盘（含读回校验后的补写）；1 = 未写入（无快照兜底也失败 / 快照里已无该节点）
+nt_apply_best_addresses() {
+    local _rf="$1"
+    local _mw _ip _tmp _edits _um _mismatch="" _count=0
+    [ -s "$_rf" ] || return 1
+    if [ -z "${NT_SNAP_FILE}" ] || [ ! -f "${NT_SNAP_FILE}" ]; then
+        # 无快照兜底（正常不可达：两条调用路径都在 nt_snapshot 失败时中止）
+        echolog "警告：无测前快照，退化为逐节点 uci set 写回"
+        while read -r _mw _ip; do
+            [ -n "$_mw" ] && [ -n "$_ip" ] || continue
+            uci set passwall.${_mw}.address="${_ip}" 2>/dev/null
+        done < "$_rf"
+        uci commit passwall 2>/dev/null
+        NT_SNAPSHOT_REAPPLIED=1
+        return 0
+    fi
+    _edits="$(mktemp "${RUN_DIR}/node_test_edits.XXXXXX")" || { echolog "创建写回清单失败"; return 1; }
+    # 守护：被测 worker 须仍在快照里（防订阅更新重排后把 address 写进空段）。此处按快照文本
+    # 判断而非 uci -q get —— 残留 delta 会让 uci 读到与文件不一致的值。
+    while read -r _mw _ip; do
+        [ -n "$_mw" ] && [ -n "$_ip" ] || continue
+        if grep -q "^config [A-Za-z0-9_]* '${_mw}'" "${NT_SNAP_FILE}" 2>/dev/null; then
+            printf '%s\t%s\n' "$_mw" "$_ip" >> "$_edits"
+            _count=$((_count + 1))
+        else
+            echolog "worker ${_mw} 在快照中已不存在，跳过写回"
+        fi
+    done < "$_rf"
+    if [ "$_count" -eq 0 ]; then
+        rm -f "$_edits"
+        return 1
+    fi
+    uci -q revert passwall 2>/dev/null
+    # 清掉上一次运行被强杀时可能留在 /etc/config 的临时文件（本次若也被强杀，留给下一次清）
+    rm -f /etc/config/.passwall_speedtest.* 2>/dev/null
+    _tmp="$(mktemp /etc/config/.passwall_speedtest.XXXXXX)" || { rm -f "$_edits"; echolog "创建配置临时文件失败"; return 1; }
+    _um="$(umask)"; umask 077
+    busybox awk 'BEGIN{q=sprintf("%c",39)}
+        NR==FNR { ip[$1]=$2; next }
+        /^config /{
+            if (cur != "" && (cur in ip) && !done[cur]) print "\toption address " q ip[cur] q
+            cur=$3; gsub(q,"",cur); done[cur]=0
+            print; next
+        }
+        /^[ \t]*option address /{
+            if (cur in ip) {
+                match($0,/^[ \t]*/)
+                print substr($0,1,RLENGTH) "option address " q ip[cur] q
+                done[cur]=1; next
+            }
+        }
+        { print }
+        END { if (cur != "" && (cur in ip) && !done[cur]) print "\toption address " q ip[cur] q }' \
+        "$_edits" "${NT_SNAP_FILE}" > "$_tmp"
+    umask "$_um"
+    chmod 600 "$_tmp" 2>/dev/null
+    if [ ! -s "$_tmp" ] || ! mv -f "$_tmp" /etc/config/passwall 2>/dev/null; then
+        rm -f "$_tmp" "$_edits"
+        echolog "警告：写回 /etc/config/passwall 失败，配置保持测前状态"
+        return 1
+    fi
+    NT_SNAPSHOT_REAPPLIED=1
+    # 读回校验（在 restart 之前，确保运行时加载的就是校验过的配置）：有不一致的用 uci 补写一次
+    while read -r _mw _ip; do
+        [ -n "$_mw" ] && [ -n "$_ip" ] || continue
+        [ "$(uci -q get passwall.${_mw}.address 2>/dev/null)" = "$_ip" ] || _mismatch="$_mismatch $_mw"
+    done < "$_edits"
+    if [ -n "$_mismatch" ]; then
+        echolog "警告：worker${_mismatch} 的 address 未按预期落盘，改用 uci 逐节点补写"
+        while read -r _mw _ip; do
+            case " $_mismatch " in *" $_mw "*) uci set passwall.${_mw}.address="${_ip}" ;; esac
+        done < "$_edits"
+        uci commit passwall 2>/dev/null
+    fi
+    rm -f "$_edits"
+    return 0
 }
 
 node_test_cleanup() {
@@ -521,8 +611,9 @@ node_test_cleanup() {
         nt_rollback
     fi
     rm -f "${NT_SNAP_FILE}" "${NT_ORIG_FILE}" 2>/dev/null
-    # 清理首完成即停用的完成标记、迭代轮次临时结果、轮次 meta 与停止标志（含中断退出残留）
-    rm -f "${RUN_DIR}"/result.csv.tmp.*.done "${RUN_DIR}"/result.csv.tmp.*.end "${RUN_DIR}"/result.csv.tmp.*.pass "${RUN_DIR}"/result.csv.tmp.*.meta "${RUN_DIR}/.nt_stop" 2>/dev/null
+    # 清理首完成即停用的完成标记、迭代轮次临时结果、轮次 meta 与停止标志（含中断退出残留）；
+    # .nt_committing 是「提交阶段勿强杀」标记，正常路径收尾已删，这里兜底中途退出的残留
+    rm -f "${RUN_DIR}"/result.csv.tmp.*.done "${RUN_DIR}"/result.csv.tmp.*.end "${RUN_DIR}"/result.csv.tmp.*.pass "${RUN_DIR}"/result.csv.tmp.*.probed "${RUN_DIR}"/result.csv.tmp.*.carry "${RUN_DIR}"/result.csv.tmp.*.union "${RUN_DIR}"/result.csv.tmp.*.meta "${RUN_DIR}/.nt_stop" "${RUN_DIR}/.nt_committing" 2>/dev/null
 }
 
 # 锁目录在会话目录内，随会话创建/销毁；原实现是死循环等待，一旦残留就把整个会话卡死。
@@ -786,7 +877,11 @@ node_iterate_worker() {
         local _idx2=0 _total
         _total=$(printf '%s\n' "$_list" | grep -c .)
         _passfile="${_rfile}.pass"
+        # 本轮「已探测过」的 IP 清单（通过与否都记）：轮次被停止/到点截断时，用它区分
+        # 「本轮测过了」和「本轮还没轮到」，后者沿用上一轮结果（见轮末合并）
+        _probedfile="${_rfile}.probed"
         echo "IP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码" > "$_passfile"
+        : > "$_probedfile"
         printf '%s\n' "$_list" | while read -r _ip; do
             [ -n "$_ip" ] || continue
             log_size_guard
@@ -794,6 +889,7 @@ node_iterate_worker() {
             [ -f "${RUN_DIR}/.iter_stop" ] && break
             [ "$(date +%s)" -ge "$_deadline" ] && { echolog "迭代 [${_Wn}] 到达时长上限，跑完当前 IP 即停"; break; }
             _idx2=$((_idx2 + 1))
+            echo "$_ip" >> "$_probedfile"
             local _out _keep _sent _recv _loss _avg
             _out=$(nt_probe_one_ip "$_W" "$_ip" "$_purl" "$_tmo" "$_probes" "$_port" "${_flag}_p${_pass}")
             _keep=${_out%% *}; _out=${_out#* }
@@ -805,17 +901,44 @@ node_iterate_worker() {
             _st=$([ "$_keep" = "1" ] && echo "保留" || echo "丢弃")
             echolog "迭代: [${_Wn}] 第 ${_pass} 轮 ${_idx2}/${_total} ($((_idx2*100/_total))%) - ${_ip} 延迟 ${_avg}ms 丢包 ${_loss} [${_st}]"
         done
-        # 本轮通过集原子落盘：有数据才覆盖结果文件并收缩候选；全挂则保留上一轮结果并退出
+        # 本轮通过集原子落盘：有数据才覆盖结果文件并收缩候选；全挂则保留上一轮结果并退出。
+        # 本轮若被停止/到点截断（只测了部分候选），未测到的 IP 沿用上一轮结果 —— 否则
+        # 「拿只测了一半的 IP 排序」会把上一轮里更优、但本轮还没轮到的 IP 直接丢掉，
+        # 节点最优 IP 也就漏了（历史现象：停止后某节点最终结果只剩本轮测过的那一小撮）。
         if [ "$(grep -c . "$_passfile" 2>/dev/null)" -gt 1 ]; then
+            local _probed _passed _carried=0 _truncated=0
+            _passed=$(( $(grep -c . "$_passfile" 2>/dev/null) - 1 ))
             sort_result "$_passfile" latency
+            _probed=$(grep -c . "$_probedfile" 2>/dev/null)
+            [ "$_probed" -lt "$_total" ] && _truncated=1
+            if [ "$_truncated" = "1" ]; then
+                # 上一轮结果里「本轮没探测过」的行原样带入（探测过但没通过的不带）
+                awk -F, 'NR==FNR { p[$1]=1; next } FNR>1 && $1!="" && $1 !~ /^#/ && !($1 in p) { print }' \
+                    "$_probedfile" "$_rfile" > "${_passfile}.carry" 2>/dev/null
+                if [ -s "${_passfile}.carry" ]; then
+                    _carried=$(grep -c . "${_passfile}.carry" 2>/dev/null)
+                    # 沿用行来自上一轮结果文件，已去掉表头，故直接整体并入（不再 sed 1d）
+                    {
+                        sed -n '1p' "$_passfile"
+                        sed '1d' "$_passfile"
+                        cat "${_passfile}.carry"
+                    } > "${_passfile}.union" 2>/dev/null
+                    sort_result "${_passfile}.union" latency
+                    mv -f "${_passfile}.union" "$_passfile"
+                    echolog "迭代 [${_Wn}] 第 ${_pass} 轮未测完（${_probed}/${_total}），未测到的 ${_carried} 个 IP 沿用上一轮结果"
+                fi
+                rm -f "${_passfile}.carry"
+            fi
             mv -f "$_passfile" "$_rfile"
+            # 下一轮候选 = 本轮结果按延迟升序（含沿用的行）→ 每轮都从最优 IP 开始测
             sed -n '2,$p' "$_rfile" 2>/dev/null | grep -v '^#' | awk -F, 'NF>=7 && $1!="" {print $1}' > "${_cand}.new"
             mv -f "${_cand}.new" "$_cand"
             _lastpass=$_pass
             _kept=$(wc -l < "$_cand" | tr -d ' ')
-            echolog "迭代 [${_Wn}] 第 ${_pass} 轮完成，通过 ${_kept}/${_total}"
-            # 收敛终止：剩余 ≤ ITERATE_KEEP_MAX 个时不再复测，保存当前结果提前结束
-            if [ "$_kept" -le "$ITERATE_KEEP_MAX" ]; then
+            echolog "迭代 [${_Wn}] 第 ${_pass} 轮完成，通过 ${_passed}/${_total}，下一轮候选 ${_kept} 个"
+            # 收敛终止：剩余 ≤ ITERATE_KEEP_MAX 个时不再复测，保存当前结果提前结束。
+            # 仅整轮测完时才判断 —— 被停止/到点截断的轮次候选数偏小，不代表收敛
+            if [ "$_truncated" = "0" ] && [ "$_kept" -le "$ITERATE_KEEP_MAX" ]; then
                 echolog "迭代 [${_Wn}] 候选收敛至 ${_kept} 个，保存结果，该节点提前结束"
                 break
             fi
@@ -989,7 +1112,7 @@ node_speed_test() {
                 for _w in $valid_workers; do
                     launched=$((launched + 1))
                     _rfile="${RUN_DIR}/result.csv.tmp.$_w"
-                    rm -f "${_rfile}.done" "${_rfile}.end" "${_rfile}.pass" 2>/dev/null
+                    rm -f "${_rfile}.done" "${_rfile}.end" "${_rfile}.pass" "${_rfile}.probed" 2>/dev/null
                     # 端口确定性分配：48900 + idx - 1（每 worker 固定端口，复用于其所有 IP）
                     _port=$((48900 + launched - 1))
                     _wips=$(get_worker_ips "$_w") || { echolog "worker 节点 $_w 候选 IP 不可用，跳过"; continue; }
@@ -1013,7 +1136,7 @@ node_speed_test() {
                     [ "$_stop" = "1" ] && break
                     launched=$((launched + 1))
                     _rfile="${RUN_DIR}/result.csv.tmp.$_w"
-                    rm -f "${_rfile}.done" "${_rfile}.end" 2>/dev/null
+                    rm -f "${_rfile}.done" "${_rfile}.end" "${_rfile}.probed" 2>/dev/null
                     # 端口确定性分配：48900 + idx - 1（每 worker 固定端口，复用于其所有 IP）
                     _port=$((48900 + launched - 1))
                     # 按 worker 取其对应 CM IP 列表（在线模式 per-worker；非在线模式共享 selected_ip_file）
@@ -1039,7 +1162,15 @@ node_speed_test() {
             NT_RUNNING=""
             # 注意：这里不能删 result.csv.tmp.*.meta——合并段还要读它打逐节点最终结果；
             # .meta 由合并循环逐个删除（随 mwfile），中断残留由 node_test_cleanup 兜底
-            rm -f "${RUN_DIR}"/result.csv.tmp.*.done "${RUN_DIR}"/result.csv.tmp.*.end "${RUN_DIR}"/result.csv.tmp.*.pass "${RUN_DIR}/.nt_stop" 2>/dev/null
+            rm -f "${RUN_DIR}"/result.csv.tmp.*.done "${RUN_DIR}"/result.csv.tmp.*.end "${RUN_DIR}"/result.csv.tmp.*.pass "${RUN_DIR}"/result.csv.tmp.*.probed "${RUN_DIR}/.nt_stop" 2>/dev/null
+            # ── 提交阶段开始：不可中断 ──
+            # 从这里到写回完成是本次运行的「提交点」：此刻若被 SIGINT 打断，EXIT/INT trap 会走
+            # nt_rollback 把刚算出的最优 IP 整份回滚掉（历史事故：用户点停止 → 20s 后强杀，
+            # 正好落在写回段中间）。故屏蔽 INT/TERM，让收尾跑完再退；SIGKILL 屏蔽不掉，但写回
+            # 已改成原子替换，被 kill -9 也只会留下测前配置或完整结果。
+            # .nt_committing 让 rpcd 的停止逻辑知道「正在提交，别强杀」，与「停止=等到写完」一致。
+            trap '' INT TERM
+            : > "${RUN_DIR}/.nt_committing"
             # 各 worker 写回各自最优（串行，单进程无锁）
             local merged reapply
             merged="$(mktemp "${RUN_DIR}/result.csv.merged.XXXXXX")"
@@ -1076,35 +1207,29 @@ node_speed_test() {
             if [ -z "$(first_result_ip "$merged")" ]; then
                 echolog "走节点测速所有 worker 结果均为空，保留上一次结果"
                 rm -f "$merged" "$reapply"
+                trap node_test_cleanup EXIT INT TERM   # 先复原信号，回滚路径照旧
                 node_test_cleanup; trap - EXIT INT TERM
                 return 1
             fi
             echo "# Speed test time: $(date +'%Y-%m-%d %H:%M:%S')" >> "$merged"
             append_persistent_history "$merged"
+            # ── 写回配置 → 重启生效 → 发布结果 ──
+            # 顺序固定：先把配置写全（原子替换 + 读回校验），再 restart 让运行时生效，最后才发布
+            # result.csv —— 保证「UI 看到新结果」就一定意味着「各节点已拿到自己的最优 IP」。
+            # 还原测前快照同时抹掉 passwall 测速中途新增的异常节点段；全局节点键（node/tcp_node）
+            # 在快照里就是测前原值，一次 restart 同时让各 worker 最优 IP + 原始全局节点生效。
+            echolog "开始写回：各节点最优 IP 写入 passwall 配置（原子替换，此阶段不可中断，请稍候）"
+            if nt_apply_best_addresses "$reapply"; then
+                /etc/init.d/passwall restart >/dev/null 2>&1 || echolog "警告：passwall restart 失败，最优 IP 可能未实时生效"
+            else
+                echolog "警告：最优 IP 未写入 passwall 配置，收尾按测前配置回滚"
+            fi
             rotate_result_files
             mv -f "$merged" "$IP_FILE"
             bestip=$(first_result_ip "$IP_FILE")
-            # ── 还原快照 → 抹掉 passwall 测速中途新增的异常节点段，再只重放本次应有的 address ──
-            # 全局节点键（node / tcp_node）在快照里就是测前原值，cp 还原即已还原；一次 restart
-            # 同时让各 worker 最优 IP + 原始全局节点生效。
-            if [ -n "${NT_SNAP_FILE}" ] && [ -f "${NT_SNAP_FILE}" ]; then
-                cp "${NT_SNAP_FILE}" /etc/config/passwall 2>/dev/null || echolog "警告：还原快照失败"
-                while read -r mw mbest; do
-                    [ -n "$mw" ] && [ -n "$mbest" ] || continue
-                    # 守护：被测 worker 在快照里仍存在（防订阅更新重排后写空段）
-                    [ -n "$(uci -q get passwall.${mw}.type 2>/dev/null)" ] || { echolog "worker ${mw} 在快照中已不存在，跳过写回"; continue; }
-                    uci set passwall.${mw}.address="${mbest}"
-                done < "$reapply"
-                uci commit passwall
-                /etc/init.d/passwall restart >/dev/null 2>&1 || echolog "警告：passwall restart 失败，最优 IP 可能未实时生效"
-                NT_SNAPSHOT_REAPPLIED=1
-                [ -n "$bestip" ] && echolog "走节点测速全部完成，全局最低延迟 IP ${bestip}（已写回各 worker 节点；已清理测速期间 passwall 新增的异常节点）"
-            else
-                # 无快照（极少见：nt_snapshot 失败）回退：直接提交本进程 staging
-                uci commit passwall
-                [ -n "$bestip" ] && echolog "走节点测速完成，全局最低延迟 IP ${bestip}（警告：无快照，未清理 passwall 异常节点）"
-            fi
-            rm -f "$reapply"
+            rm -f "$reapply" "${RUN_DIR}/.nt_committing" 2>/dev/null
+            trap node_test_cleanup EXIT INT TERM
+            [ -n "$bestip" ] && echolog "走节点测速全部完成，全局最低延迟 IP ${bestip}（已写回各 worker 节点；已清理测速期间 passwall 新增的异常节点）"
             NODE_TEST_DONE=1; node_test_cleanup; trap - EXIT INT TERM
             return 0
         fi
@@ -1155,9 +1280,14 @@ node_speed_test() {
         node_test_worker 1 "${NODE_TEST_NODE}" "${NODE_TEST_ORIG_ADDR}" "$result_tmp" "$ip_list" "$probe_url" "$timeout" "$probes" 48900 "${NODE_TEST_FLAG_BASE}"
     fi
 
+    # ── 提交阶段开始：不可中断（同多 worker 路径：此刻被 INT 打断会触发 nt_rollback 抹掉结果）──
+    trap '' INT TERM
+    : > "${RUN_DIR}/.nt_committing"
+
     if [ -z "$(first_result_ip "$result_tmp")" ]; then
         echolog "走节点测速结果 IP 数量为 0，整份回滚并保留上一次结果"
         rm -f "$result_tmp"
+        trap node_test_cleanup EXIT INT TERM   # 先复原信号，回滚路径照旧
         node_test_cleanup; trap - EXIT INT TERM
         return 1
     fi
@@ -1170,19 +1300,24 @@ node_speed_test() {
         && [ -s "${result_tmp}.nn" ] && mv -f "${result_tmp}.nn" "$result_tmp"
 
     echo "# Speed test time: $(date +'%Y-%m-%d %H:%M:%S')" >> "$result_tmp"
+
+    # ── 写回配置 → 重启生效 → 发布结果（同多 worker 路径：先落盘配置，再发布结果）──
+    bestip=$(first_result_ip "$result_tmp")
+    local _reapply
+    _reapply="$(mktemp "${RUN_DIR}/node_test_reapply.XXXXXX")"
+    printf '%s\t%s\n' "${NODE_TEST_NODE}" "${bestip}" > "$_reapply"
+    echolog "开始写回：节点 ${NODE_TEST_NODE} 最优 IP ${bestip} 写入 passwall 配置（原子替换，此阶段不可中断，请稍候）"
+    if nt_apply_best_addresses "$_reapply"; then
+        /etc/init.d/passwall restart >/dev/null 2>&1 || echolog "警告：passwall restart 失败，最优 IP 可能未实时生效"
+        echolog "走节点测速完成，最优 IP ${bestip} 已写入 passwall 节点 ${NODE_TEST_NODE}（已清理测速期间 passwall 新增的异常节点）"
+    else
+        echolog "警告：最优 IP 未写入 passwall 配置，收尾按测前配置回滚"
+    fi
+    rm -f "$_reapply"
     rotate_result_files
     mv -f "$result_tmp" "$IP_FILE"
-
-    bestip=$(first_result_ip "$IP_FILE")
-    # ── 还原快照 → 抹掉 passwall 测速中途新增的异常节点段，再只写回本节点最优 IP ──
-    if [ -n "${bestip}" ] && [ -n "${NT_SNAP_FILE}" ] && [ -f "${NT_SNAP_FILE}" ]; then
-        cp "${NT_SNAP_FILE}" /etc/config/passwall 2>/dev/null || echolog "警告：还原快照失败"
-        [ -n "$(uci -q get passwall.${NODE_TEST_NODE}.type 2>/dev/null)" ] && uci set passwall.${NODE_TEST_NODE}.address="${bestip}"
-        uci commit passwall
-        /etc/init.d/passwall restart >/dev/null 2>&1 || echolog "警告：passwall restart 失败，最优 IP 可能未实时生效"
-        NT_SNAPSHOT_REAPPLIED=1
-        echolog "走节点测速完成，最优 IP ${bestip} 已写入 passwall 节点 ${NODE_TEST_NODE}（已清理测速期间 passwall 新增的异常节点）"
-    fi
+    rm -f "${RUN_DIR}/.nt_committing" 2>/dev/null
+    trap node_test_cleanup EXIT INT TERM
 
     NODE_TEST_DONE=1; node_test_cleanup; trap - EXIT INT TERM
     return 0
