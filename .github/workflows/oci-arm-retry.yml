@@ -2,7 +2,8 @@ name: oci-arm-retry
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    # 避开整点/整十分（GitHub 在这些时刻最拥堵，容易延迟或跳过）
+    - cron: "3,13,23,33,43,53 * * * *"
   workflow_dispatch:
 
 permissions:
