@@ -1,0 +1,121 @@
+name: oci-arm-retry
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: oci-arm-retry
+  cancel-in-progress: false
+
+jobs:
+  launch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    steps:
+      - name: Install OCI CLI
+        run: pip install --quiet oci-cli
+
+      - name: Configure OCI CLI
+        env:
+          OCI_KEY_CONTENT: ${{ secrets.OCI_KEY_CONTENT }}
+          OCI_USER: ${{ secrets.OCI_USER }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_TENANCY: ${{ secrets.OCI_TENANCY }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+        run: |
+          mkdir -p "$HOME/.oci"
+          printf '%s\n' "$OCI_KEY_CONTENT" > "$HOME/.oci/key.pem"
+          chmod 600 "$HOME/.oci/key.pem"
+
+          cat > "$HOME/.oci/config" <<EOF
+          [DEFAULT]
+          user=$OCI_USER
+          fingerprint=$OCI_FINGERPRINT
+          tenancy=$OCI_TENANCY
+          region=$OCI_REGION
+          key_file=$HOME/.oci/key.pem
+          EOF
+
+          oci iam region list --output table > /dev/null && echo "OCI CLI OK"
+
+      - name: Check existing instance
+        id: exists
+        env:
+          COMPARTMENT: ${{ secrets.OCI_COMPARTMENT }}
+        run: |
+          existing=$(oci compute instance list \
+            --compartment-id "$COMPARTMENT" \
+            --query 'data[?"display-name"==`free-arm-1` && "lifecycle-state"!=`TERMINATED`].id' \
+            --raw-output 2>/dev/null)
+
+          if [ -n "$existing" ]; then
+            echo "实例已存在：$existing"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build launch.json
+        if: steps.exists.outputs.found != 'true'
+        env:
+          COMPARTMENT: ${{ secrets.OCI_COMPARTMENT }}
+          AD: ${{ secrets.OCI_AD }}
+          IMAGE: ${{ secrets.OCI_IMAGE }}
+          SUBNET: ${{ secrets.OCI_SUBNET }}
+          SSH_PUBKEY: ${{ secrets.OCI_SSH_PUBKEY }}
+        run: |
+          jq -n \
+            --arg c "$COMPARTMENT" \
+            --arg ad "$AD" \
+            --arg img "$IMAGE" \
+            --arg sn "$SUBNET" \
+            --arg key "$SSH_PUBKEY" \
+            '{
+              compartmentId: $c,
+              availabilityDomain: $ad,
+              shape: "VM.Standard.A1.Flex",
+              shapeConfig: { ocpus: 1, memoryInGBs: 6 },
+              imageId: $img,
+              subnetId: $sn,
+              assignPublicIp: true,
+              displayName: "free-arm-1",
+              metadata: { ssh_authorized_keys: $key }
+            }' > "$RUNNER_TEMP/launch.json"
+          cat "$RUNNER_TEMP/launch.json"
+
+      - name: Launch instance
+        id: launch
+        if: steps.exists.outputs.found != 'true'
+        run: |
+          if oci compute instance launch \
+              --from-json "file://$RUNNER_TEMP/launch.json" \
+              --no-retry --output json > "$RUNNER_TEMP/launch.log" 2>&1; then
+            echo "✅ 创建成功"
+            instance_id=$(jq -r '.id' "$RUNNER_TEMP/launch.log")
+            echo "instance: $instance_id"
+            ip=$(oci compute instance list-vnics --instance-id "$instance_id" \
+              --query 'data[0]."public-ip"' --raw-output 2>/dev/null || true)
+            echo "public ip: $ip"
+            echo "created=true" >> "$GITHUB_OUTPUT"
+          else
+            if grep -qi "Out of host capacity" "$RUNNER_TEMP/launch.log"; then
+              echo "容量不足，等下次定时任务"
+              exit 0
+            fi
+            echo "其他错误："
+            cat "$RUNNER_TEMP/launch.log"
+            exit 1
+          fi
+
+      - name: Disable schedule on success
+        if: steps.launch.outputs.created == 'true' || steps.exists.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow disable oci-arm-retry.yml || true
