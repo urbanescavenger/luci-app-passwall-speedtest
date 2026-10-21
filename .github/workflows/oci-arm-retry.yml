@@ -1,9 +1,7 @@
 name: oci-arm-retry
 
-# 仓库已脱离 fork 网络，schedule 可正常触发
 on:
   schedule:
-    # 避开整点/整十分（GitHub 在这些时刻最拥堵，容易延迟或跳过）
     - cron: "3,13,23,33,43,53 * * * *"
   workflow_dispatch:
 
@@ -13,12 +11,12 @@ permissions:
 
 concurrency:
   group: oci-arm-retry
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   launch:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 360
 
     steps:
       - name: Install OCI CLI
@@ -48,25 +46,7 @@ jobs:
 
           oci iam region list --output table > /dev/null && echo "OCI CLI OK"
 
-      - name: Check existing instance
-        id: exists
-        env:
-          COMPARTMENT: ${{ secrets.OCI_COMPARTMENT }}
-        run: |
-          existing=$(oci compute instance list \
-            --compartment-id "$COMPARTMENT" \
-            --query 'data[?"display-name"==`free-arm-1` && "lifecycle-state"!=`TERMINATED`].id' \
-            --raw-output 2>/dev/null)
-
-          if [ -n "$existing" ]; then
-            echo "实例已存在：$existing"
-            echo "found=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "found=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Build launch.json
-        if: steps.exists.outputs.found != 'true'
         env:
           COMPARTMENT: ${{ secrets.OCI_COMPARTMENT }}
           AD: ${{ secrets.OCI_AD }}
@@ -91,38 +71,66 @@ jobs:
               displayName: "free-arm-1",
               metadata: { ssh_authorized_keys: $key }
             }' > "$RUNNER_TEMP/launch.json"
-          cat "$RUNNER_TEMP/launch.json"
 
-      - name: Launch instance
-        id: launch
-        if: steps.exists.outputs.found != 'true'
+      - name: Retry loop
+        id: loop
+        env:
+          COMPARTMENT: ${{ secrets.OCI_COMPARTMENT }}
         run: |
-          if oci compute instance launch \
-              --from-json "file://$RUNNER_TEMP/launch.json" \
-              --no-retry --output json > "$RUNNER_TEMP/launch.log" 2>&1; then
-            echo "✅ 创建成功"
-            instance_id=$(jq -r '.id' "$RUNNER_TEMP/launch.log")
-            echo "instance: $instance_id"
-            ip=$(oci compute instance list-vnics --instance-id "$instance_id" \
-              --query 'data[0]."public-ip"' --raw-output 2>/dev/null || true)
-            echo "public ip: $ip"
-            echo "created=true" >> "$GITHUB_OUTPUT"
-          else
-            if grep -qi "Out of host capacity" "$RUNNER_TEMP/launch.log"; then
-              echo "容量不足，等下次定时任务"
-              exit 0
-            fi
-            if grep -qi "Too many requests" "$RUNNER_TEMP/launch.log"; then
-              echo "触发限流，等下次定时任务"
-              exit 0
-            fi
-            echo "其他错误："
-            cat "$RUNNER_TEMP/launch.log"
-            exit 1
-          fi
+          deadline=$(( $(date +%s) + 18000 ))   # 5 小时
+          attempt=0
 
-      - name: Disable schedule on success
-        if: steps.launch.outputs.created == 'true' || steps.exists.outputs.found == 'true'
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            attempt=$((attempt + 1))
+            echo "[$(date '+%F %T')] 第 $attempt 次尝试"
+
+            existing=$(oci compute instance list \
+              --compartment-id "$COMPARTMENT" \
+              --query 'data[?"display-name"==`free-arm-1` && "lifecycle-state"!=`TERMINATED`].id' \
+              --raw-output 2>/dev/null)
+            if [ -n "$existing" ]; then
+              echo "实例已存在：$existing"
+              echo "stop=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            if oci compute instance launch \
+                --from-json "file://$RUNNER_TEMP/launch.json" \
+                --no-retry --output json > "$RUNNER_TEMP/launch.log" 2>&1; then
+              echo "✅ 创建成功"
+              instance_id=$(jq -r '.id' "$RUNNER_TEMP/launch.log")
+              echo "instance: $instance_id"
+              ip=$(oci compute instance list-vnics --instance-id "$instance_id" \
+                --query 'data[0]."public-ip"' --raw-output 2>/dev/null || true)
+              echo "public ip: $ip"
+              echo "stop=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            if grep -qi "Out of host capacity" "$RUNNER_TEMP/launch.log"; then
+              echo "  容量不足，等下一轮"
+              sleep $((540 + RANDOM % 120))
+            elif grep -qi "Too many requests" "$RUNNER_TEMP/launch.log"; then
+              echo "  被限流，等 15 分钟"
+              sleep 900
+            else
+              echo "  其他错误："
+              cat "$RUNNER_TEMP/launch.log"
+              sleep 300
+            fi
+          done
+
+          echo "本轮 5 小时结束，续链"
+          echo "chain=true" >> "$GITHUB_OUTPUT"
+
+      - name: Disable workflow on success
+        if: steps.loop.outputs.stop == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh workflow disable oci-arm-retry.yml || true
+
+      - name: Chain next run
+        if: steps.loop.outputs.chain == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run oci-arm-retry.yml --repo "$GITHUB_REPOSITORY"
