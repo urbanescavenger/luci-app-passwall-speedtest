@@ -1,5 +1,6 @@
 name: oci-arm-retry
 
+# 仓库已脱离 fork 网络，schedule 可正常触发
 on:
   schedule:
     # 避开整点/整十分（GitHub 在这些时刻最拥堵，容易延迟或跳过）
