@@ -42,6 +42,7 @@ jobs:
           region=$OCI_REGION
           key_file=$HOME/.oci/key.pem
           EOF
+          chmod 600 "$HOME/.oci/config"
 
           oci iam region list --output table > /dev/null && echo "OCI CLI OK"
 
@@ -107,6 +108,10 @@ jobs:
           else
             if grep -qi "Out of host capacity" "$RUNNER_TEMP/launch.log"; then
               echo "容量不足，等下次定时任务"
+              exit 0
+            fi
+            if grep -qi "Too many requests" "$RUNNER_TEMP/launch.log"; then
+              echo "触发限流，等下次定时任务"
               exit 0
             fi
             echo "其他错误："
