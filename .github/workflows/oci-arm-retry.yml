@@ -90,6 +90,9 @@ jobs:
               --raw-output 2>/dev/null)
             if [ -n "$existing" ]; then
               echo "实例已存在：$existing"
+              ip=$(oci compute instance list-vnics --instance-id "$existing" \
+                --query 'data[0]."public-ip"' --raw-output 2>/dev/null || true)
+              echo "public ip: $ip"
               echo "stop=true" >> "$GITHUB_OUTPUT"
               exit 0
             fi
@@ -98,7 +101,7 @@ jobs:
                 --from-json "file://$RUNNER_TEMP/launch.json" \
                 --no-retry --output json > "$RUNNER_TEMP/launch.log" 2>&1; then
               echo "✅ 创建成功"
-              instance_id=$(jq -r '.id' "$RUNNER_TEMP/launch.log")
+              instance_id=$(jq -r '.id // .data.id // empty' "$RUNNER_TEMP/launch.log")
               echo "instance: $instance_id"
               ip=$(oci compute instance list-vnics --instance-id "$instance_id" \
                 --query 'data[0]."public-ip"' --raw-output 2>/dev/null || true)
@@ -127,7 +130,7 @@ jobs:
         if: steps.loop.outputs.stop == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh workflow disable oci-arm-retry.yml || true
+        run: gh workflow disable oci-arm-retry.yml --repo "$GITHUB_REPOSITORY" || true
 
       - name: Chain next run
         if: steps.loop.outputs.chain == 'true'
