@@ -180,11 +180,13 @@ function run_dir() {
 
 // 协作式停止：写本次会话的停止标志 .nt_stop，各 worker 跑完当前 IP 自行 break；
 // 另写 .iter_stop，限时迭代模式据此在轮间不再开新轮。
+// .user_stop 区分「用户手动停止」与「首个 worker 完成后的自动提前停止」（后者写 .auto_stop）：
+// 用户停止第一轮后，脚本仍会对已通过的 IP 做完下载实测再写回；自动提前停止则不排队下载。
 // 停止的语义是「停止测速，但把已测到的各节点最优 IP 写完再退」：脚本收尾要还原测前快照、
 // 原子写回配置、再重启 passwall 才生效，而 passwall 的 restart 会在自己的锁上等最多 600s，
 // 所以这里不按固定秒数强杀：进程还活着就一直等；只有没进提交阶段（无 .nt_committing）且
-// 长时间不动（真挂死，~120s）才升级信号；进了提交阶段则放宽到 ~1200s 才兜底。
-// 强杀只针对记录的 PID 本身，不再 pgrep 通杀 —— 否则会误杀随后新起的那次运行。
+// 长时间不动（真挂死，~120s）才升级信号；进了提交/下载收尾阶段（.nt_committing）则放宽到
+// ~1200s 才兜底。强杀只针对记录的 PID 本身，不再 pgrep 通杀 —— 否则会误杀随后新起的那次运行。
 function stop() {
 	let dir = run_dir();
 	let pid = run_pid();
@@ -192,7 +194,7 @@ function stop() {
 	if (dir == null || pid == null)
 		return {};
 
-	command('touch ' + shquote(dir + '/.nt_stop') + ' ' + shquote(dir + '/.iter_stop') + ' 2>/dev/null');
+	command('touch ' + shquote(dir + '/.nt_stop') + ' ' + shquote(dir + '/.iter_stop') + ' ' + shquote(dir + '/.user_stop') + ' 2>/dev/null');
 	command('( _w=0; while kill -0 ' + pid + ' 2>/dev/null; do' +
 		' if [ -f ' + shquote(dir + '/.nt_committing') + ' ]; then [ "$_w" -ge 1200 ] && break; else [ "$_w" -ge 120 ] && break; fi;' +
 		' sleep 3; _w=$((_w + 3));' +

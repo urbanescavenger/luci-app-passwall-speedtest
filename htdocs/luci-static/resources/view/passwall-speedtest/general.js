@@ -390,15 +390,17 @@ return view.extend({
 						}, 500);
 					});
 				}
-				// 运行中 → 停止：协作式收尾（跑完当前 IP → 原子写回各节点最优 IP → 重启 passwall
-				// 生效）约 ~timeout×probes 起，passwall restart 慢时可能几分钟，故轮询到真正退出
-				// 再把按钮切回 Start（s.running 仍为真时保持 Stop，不谎报已停止）
+				// 运行中 → 停止：协作式收尾。用户停止第一轮后，脚本仍会把已通过 IP 的下载
+				// 实测做完（多 worker 串行，最多 5 个/worker × 单 IP 时限），再写回并重启
+				// passwall，因此可能比原来的 ~timeout×probes 长很多。这里按 2s 轮询到真正
+				// 退出（最多约 20 分钟，与 rpcd 的 1200s 收尾宽限一致）；s.running 仍为真时
+				// 保持 Stop，不谎报已停止。
 				return callStop().then(function() {
 					const waitStopped = function(tries) {
 						tries = tries || 0;
 						return callStatus().then(function(s) {
 							view.updateStatus(statusNode, s);
-							if (s && s.running && tries < 90) {
+							if (s && s.running && tries < 610) {
 								return new Promise(function(r) { window.setTimeout(r, 2000); })
 									.then(function() { return waitStopped(tries + 1); });
 							}

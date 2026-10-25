@@ -663,7 +663,7 @@ node_test_cleanup() {
     rm -f "${NT_SNAP_FILE}" "${NT_ORIG_FILE}" 2>/dev/null
     # 清理首完成即停用的完成标记、迭代轮次临时结果、轮次 meta 与停止标志（含中断退出残留）；
     # .nt_committing 是「提交阶段勿强杀」标记，正常路径收尾已删，这里兜底中途退出的残留
-    rm -f "${RUN_DIR}"/result.csv.tmp.*.done "${RUN_DIR}"/result.csv.tmp.*.end "${RUN_DIR}"/result.csv.tmp.*.pass "${RUN_DIR}"/result.csv.tmp.*.probed "${RUN_DIR}"/result.csv.tmp.*.carry "${RUN_DIR}"/result.csv.tmp.*.union "${RUN_DIR}"/result.csv.tmp.*.meta "${RUN_DIR}/.nt_stop" "${RUN_DIR}/.nt_committing" 2>/dev/null
+    rm -f "${RUN_DIR}"/result.csv.tmp.*.done "${RUN_DIR}"/result.csv.tmp.*.end "${RUN_DIR}"/result.csv.tmp.*.pass "${RUN_DIR}"/result.csv.tmp.*.probed "${RUN_DIR}"/result.csv.tmp.*.carry "${RUN_DIR}"/result.csv.tmp.*.union "${RUN_DIR}"/result.csv.tmp.*.meta "${RUN_DIR}/.nt_stop" "${RUN_DIR}/.nt_committing" "${RUN_DIR}/.auto_stop" "${RUN_DIR}/.user_stop" 2>/dev/null
 }
 
 # 锁目录在会话目录内，随会话创建/销毁；原实现是死循环等待，一旦残留就把整个会话卡死。
@@ -693,9 +693,9 @@ nt_dl_lock_acquire() {
     local _token="$1" _i=0
     [ -n "${DL_LOCK_DIR:-}" ] || return 0
     while ! mkdir "$DL_LOCK_DIR" 2>/dev/null; do
-        # 等锁期间收到停止信号（用户停止/别的 worker 先完成）→ 不再排队下载
-        if [ -n "${RUN_DIR:-}" ] && \
-           { [ -f "${RUN_DIR}/.nt_stop" ] || [ -f "${RUN_DIR}/.iter_stop" ]; }; then
+        # 等锁期间只有「其它 worker 已先完成」的自动提前停止才放弃排队；用户中途停止
+        # 一轮测速时仍要排队把下载实测做完（见 .user_stop / .auto_stop 的区分）。
+        if [ -n "${RUN_DIR:-}" ] && [ -f "${RUN_DIR}/.auto_stop" ]; then
             return 1
         fi
         _i=$((_i + 1))
@@ -958,14 +958,21 @@ nt_download_phase() {
     echo "$_hdr" > "$_out"
 
     echolog "下载测速 [${_Wn}] 开始：对延迟最优的 ${_cnt} 个 IP 实测下载（${_durl}，单 IP 上限 ${_tmo}s）"
+    # 用户中途停止「第一轮」时仍要完成下载实测：写 .nt_committing 让 rpcd 的停止逻辑
+    # 给足收尾时间（最长 1200s），不要按 120s 强杀在下载/写回中间。
+    if [ -f "${RUN_DIR}/.user_stop" ]; then
+        : > "${RUN_DIR}/.nt_committing" 2>/dev/null
+        echolog "下载测速 [${_Wn}] 用户已停止一轮测速，仍继续完成下载实测后再写回退出"
+    fi
     while IFS= read -r _line; do
         [ -n "$_line" ] || continue
         _i=$((_i + 1))
         if [ "$_i" -le "$_cnt" ] && [ "$_stopped" = "0" ]; then
-            # 用户停止/别的 worker 先完成时不再开启新的下载；已测到的速度仍然保留
-            if [ -f "${RUN_DIR}/.nt_stop" ] || [ -f "${RUN_DIR}/.iter_stop" ]; then
+            # 只有「其它 worker 已先完成」的自动提前停止才跳过下载；用户停止一轮时
+            # .auto_stop 不存在，下载实测继续（这正是二轮测速的意义）。
+            if [ -f "${RUN_DIR}/.auto_stop" ]; then
                 _stopped=1
-                echolog "下载测速 [${_Wn}] 收到停止信号，余下 IP 不再下载测速"
+                echolog "下载测速 [${_Wn}] 其它 worker 已先完成，余下 IP 不再下载测速"
             fi
         fi
         if [ "$_i" -le "$_cnt" ] && [ "$_stopped" = "0" ]; then
@@ -1453,7 +1460,17 @@ node_speed_test() {
                 done
                 # 提前停止：写停止标志，其余 worker 跑完当前 IP 自行 break 退出，wait 收尸（不 kill）
                 if [ "$_stop" = "1" ]; then
-                    echolog "首个有效结果 worker 完成，其余 worker 跑完当前 IP 即停，按已有结果排序"
+                    # 用户手动停止时（.user_stop 已存在）不能写 .auto_stop：否则其它 worker
+                    # 会跳过二轮下载实测。用户停止的语义是「停第一轮，但把已通过 IP 的下载
+                    # 做完再写回」，所以此处只阻止新一轮延迟探测（.nt_stop），不阻止下载。
+                    if [ -f "${RUN_DIR}/.user_stop" ]; then
+                        echolog "用户已停止一轮测速，其余 worker 继续完成各自下载实测"
+                    else
+                        echolog "首个有效结果 worker 完成，其余 worker 跑完当前 IP 即停，按已有结果排序"
+                        # .auto_stop 只标记「首个 worker 已完成」的自动提前停止：其余 worker
+                        # 不再排队做下载实测，避免首个 worker 出结果后还串行下载很久。
+                        : > "${RUN_DIR}/.auto_stop"
+                    fi
                     : > "${RUN_DIR}/.nt_stop"
                     wait  # 各 worker 自行 break → 写 .done/.end → 正常退出，wait 收尸
                 fi

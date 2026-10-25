@@ -26,7 +26,7 @@
 *   **Proxy Integration**: Writes the best IP back to ssr / passwall / passwall2 / bypass / vssr nodes, and to HOST / MosDNS / astra-dns / Alibaba Cloud DDNS.
 *   **Visual Charts**: History chart for latency trends; hovering/clicking a point shows that node's best IP, latency and measured download speed (latency only when no download test was run).
 *   **Improved UI & Logs**: Redesigned status display; per-IP log lines like `进度: 走节点测速 [node] 5/30 (16%) - 1.2.3.4 延迟 87ms 丢包 0.00 [保留]`.
-*   **Partial Results Saved on Stop**: Stopping mid-test triggers a trap that cleans up SOCKS, restores node addresses, and keeps the previous result if nothing new was measured.
+*   **Partial Results Saved on Stop**: Stopping mid-test triggers a trap that cleans up SOCKS, restores node addresses, and keeps the previous result if nothing new was measured. **When the user stops round one manually, the IPs that already passed latency still complete the download test** (up to 5 per worker, serialized across workers) before write-back. Only the automatic early stop (after the first worker finishes) skips other workers' downloads.
 *   **Broad Integrations**: The best IP can be automatically applied to SSR+ / Passwall / PassWall2 / Bypass / Vssr / HOST / MosDNS / astra-dns / Alibaba Cloud DDNS.
 
 ## UI Pages
