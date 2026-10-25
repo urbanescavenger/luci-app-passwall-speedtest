@@ -9,7 +9,7 @@
 		},
 		"write": {
 			"ubus": {
-				"passwall-speedtest": [ "start", "stop" ]
+				"passwall-speedtest": [ "start", "start_retest", "stop" ]
 			},
 			"uci": [ "passwall-speedtest" ]
 		}

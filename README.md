@@ -5,9 +5,9 @@
 
 [中文说明](README.CN.md)
 
-**luci-app-passwall-speedtest** is a LuCI application for OpenWrt that selects the best Cloudflare IP by probing candidate IPs **through your existing [PassWall](https://github.com/xiaorouji/openwrt-passwall) nodes**. It writes each candidate IP into a passwall node's `address`, spins up a local SOCKS via passwall, and measures HTTP HEAD latency (`time_pretransfer`); the fastest IP is then written back to the passwall node(s) and other integrations.
+**luci-app-passwall-speedtest** is a LuCI application for OpenWrt that selects the best Cloudflare IP **through your existing [PassWall](https://github.com/xiaorouji/openwrt-passwall) nodes**. It writes each candidate IP into a passwall node's `address` and spins up a local SOCKS via passwall: first it screens every candidate with HTTP HEAD latency (`time_pretransfer`); then, for each worker's N lowest-latency IPs, it downloads a real fixed-size file over the same node chain and measures actual throughput (MB/s). The final best IP is written back to the passwall node(s) and other integrations.
 
-> This is a refactor of the original `luci-app-cloudflarespeedtest`: the standalone `CloudflareSpeedTest` binary download path has been removed. The test now runs entirely through passwall — no external test binary is downloaded or bundled. Only latency is measured (no download bandwidth).
+> This is a refactor of the original `luci-app-cloudflarespeedtest`: the standalone `CloudflareSpeedTest` binary download path has been removed. The test now runs entirely through passwall — no external test binary is downloaded or bundled. It is two-stage: cheap latency screening across all candidates, then a real download test on the few most promising ones.
 
 ## Requirements
 
@@ -18,11 +18,13 @@
 ## Features
 
 *   **Node-Based Latency Test**: Probes candidate Cloudflare IPs through your passwall node chain — finds the best CF IP *as seen from your proxy's egress*.
+*   **Latency Screening + Real Download Test**: Latency first (cheap, covers every candidate), then a real fixed-size download through each worker's N lowest-latency IPs (default 5, max 5) over the same node chain; `speed_download` from curl is converted to MB/s. The final best IP is picked by measured throughput; IPs whose download fails are dropped; if every download fails (e.g. the URL is unreachable through that node), the latency ranking is kept. Each IP gets its own SOCKS config, and the generated `/tmp/etc/passwall/<flag>.json` is verified to point at the candidate IP before a speed is accepted, so the number cannot come from an unrelated path. Download tests across workers run **one at a time** — concurrent downloads would split the router's WAN bandwidth and make the per-IP numbers incomparable. In iterative mode the download phase runs after convergence and does not count toward `iterate_minutes`.
+*   **Retest Current Best IPs**: A dedicated button on the Plugin Settings page (CLI: `passwall-speedtest.sh retest`) — it does **not** re-download the online IP list. Candidates come only from the current `result.csv` rows for each node plus that node's current `address`; it then runs ONE latency round + the download test and writes the best IP back as usual. Useful for quickly validating the existing best IPs after a scheduled run without pulling tens of thousands of candidates.
 *   **Multi-Threaded Workers**: Passwall nodes selected in the Third-Party tab run as parallel workers — each tests all candidate IPs through its own chain and gets its own best IP written back. Concurrency is capped by `node_test_threads`.
 *   **Fail-Fast Multi-Probe**: Each IP is probed `node_test_probes` times; if any probe fails, the IP is discarded immediately. Only IPs that succeed on all probes are kept, so the result is a stable one.
 *   **Time-Boxed Iterative Test**: With `iterate_enabled`, each tested node runs its **own independent convergence loop** until `iterate_minutes` elapses: after its first pass it only re-tests the IPs that passed its previous pass, so its candidate pool shrinks toward the most stable, lowest-latency IPs. Nothing is written to result.csv or passwall mid-run. A node saves its result and exits early once its pool converges to **≤ 3 IPs** — no need to wait out the timer; at the end each node's final-pass results are printed to the log before one final merge writes every node's best IP.
 *   **Proxy Integration**: Writes the best IP back to ssr / passwall / passwall2 / bypass / vssr nodes, and to HOST / MosDNS / astra-dns / Alibaba Cloud DDNS.
-*   **Visual Charts**: History chart for latency trends (download-speed chart removed — node mode is latency-only).
+*   **Visual Charts**: History chart for latency trends; hovering/clicking a point shows that node's best IP, latency and measured download speed (latency only when no download test was run).
 *   **Improved UI & Logs**: Redesigned status display; per-IP log lines like `进度: 走节点测速 [node] 5/30 (16%) - 1.2.3.4 延迟 87ms 丢包 0.00 [保留]`.
 *   **Partial Results Saved on Stop**: Stopping mid-test triggers a trap that cleans up SOCKS, restores node addresses, and keeps the previous result if nothing new was measured.
 *   **Broad Integrations**: The best IP can be automatically applied to SSR+ / Passwall / PassWall2 / Bypass / Vssr / HOST / MosDNS / astra-dns / Alibaba Cloud DDNS.
@@ -45,14 +47,18 @@ Three pages under LuCI → Services → PassWall Speed Test:
 *   **Probe timeout**: Per-IP curl `--max-time` (seconds).
 *   **Probes per IP**: Number of curl probes per IP (all must succeed or the IP is discarded).
 *   **Max parallel workers**: Concurrency cap for multi-node mode (0 = all).
-*   **Time-boxed iterative test / duration**: Time-boxed mode where each tested node runs an independent convergence loop (each pass only re-tests IPs that passed the previous pass); at the deadline the best remaining IP per node is written back.
+*   **Real download speed test** (`download_test_enabled`, on by default): after latency screening, measure actual throughput on a few candidates.
+*   **Download-test candidates per worker** (`download_test_count`, default 5, max 5): only the N lowest-latency IPs of each worker are download-tested. This consumes real proxy traffic: with the default 10 MB URL, up to about 50 MB per worker, added up across workers (tests are serialized).
+*   **Download test URL** (`download_test_url`): fixed-size file fetched through the node's local SOCKS; defaults to Cloudflare `speed.cloudflare.com/__down?bytes=10000000` (10 MB). The response must be HTTP 2xx with at least 16 KB of data.
+*   **Download test time limit** (`download_test_time`, default 10s): per-IP curl `--max-time`; a transfer cut off by the limit still yields a valid average speed from the bytes received.
+*   **Time-boxed iterative test / duration**: Time-boxed mode where each tested node runs an independent convergence loop (each pass only re-tests IPs that passed the previous pass); at the deadline the best remaining IP per node is written back. After convergence, the final passing set's N lowest-latency IPs also go through the download test.
 
 ## How the Best IP Is Applied
 
 After a test completes:
 
-*   Each passwall worker node gets its own best IP written to `passwall.<node>.address`.
-*   The global lowest-latency IP is written automatically to: HOST (`/etc/hosts`), MosDNS, astra-dns, Alibaba Cloud DDNS, and the `server`/`address` field of ssr / passwall / passwall2 / bypass / vssr nodes.
+*   Each passwall worker node gets its own best IP written to `passwall.<node>.address`. With the download test enabled, "best" means highest measured throughput (failed downloads are excluded); otherwise, or when every download fails, it falls back to lowest latency.
+*   The global best IP (first row of `result.csv`; the highest throughput when download tests succeeded) is written automatically to: HOST (`/etc/hosts`), MosDNS, astra-dns, Alibaba Cloud DDNS, and the `server`/`address` field of ssr / passwall / passwall2 / bypass / vssr nodes.
 
 > Note: The plugin does not modify `ip route`. The best IP takes effect through hosts / DNS / proxy nodes.
 
@@ -64,7 +70,7 @@ Every full run takes a single-instance lock at its entry point: only one run at 
 
 ## Results & History
 
-Results are saved to `/tmp/passwall-speedtest/result.csv` with 10 rolling historical versions kept; the Best IP area shows the last 100 lines, and the latency chart plots the most recent 10 results.
+Results are saved to `/tmp/passwall-speedtest/result.csv` with 10 rolling historical versions kept; the Best IP area shows every row grouped per node. Column 6 `下载速度(MB/s)` holds the real download measurement — only the N lowest-latency IPs per worker are filled; rows that were not download-tested (or runs with the download test disabled) keep `0.00`. The latency chart plots the persistent history.
 
 Run logs are kept at `/tmp/passwall-speedtest.log`; at the start of each run the previous log is rotated to `.log.1` ~ `.log.5` (last 5 runs; `/tmp` is a RAM disk — cleared on reboot, never written to flash). In addition, when each run finishes its full log is **overwritten** to `/etc/config/passwall-speedtest.log` (same directory as the UCI config — persistent across reboots, keeps only the most recent run). The log page shows whole lines including `[node remark]` and `[kept]/[dropped]` tags, so per-node iteration rounds can be read directly.
 

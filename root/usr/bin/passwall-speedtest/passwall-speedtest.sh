@@ -22,6 +22,9 @@ SCRIPT_DIR='/usr/bin/passwall-speedtest'
 # 迭代模式：单节点候选收敛到 ≤ 此数量即保存结果提前结束（继续复测收益小）
 ITERATE_KEEP_MAX=3
 
+# 复测模式（retest）：候选只取当前 result.csv + 各节点当前 address，不重新下载在线列表
+RETEST_FROM_RESULT=0
+
 function get_global_config(){
     while [[ "$*" != "" ]]; do
         eval ${1}='`uci get passwall-speedtest.global.$1`' 2>/dev/null
@@ -122,7 +125,7 @@ reap_stale_run_dirs() {
 }
 
 function read_config(){
-    get_global_config "enabled" "custom_cron_enabled" "custom_cron" "tl" "tll" "tlr" "ip_source" "custom_ip_file" "custom_allip" "ip_online_url" "ip_online_regions" "node_test_node" "stable_node" "node_test_url" "node_test_count" "node_test_timeout" "node_test_probes" "node_test_threads" "iterate_enabled" "iterate_minutes"
+    get_global_config "enabled" "custom_cron_enabled" "custom_cron" "tl" "tll" "tlr" "ip_source" "custom_ip_file" "custom_allip" "ip_online_url" "ip_online_regions" "node_test_node" "stable_node" "node_test_url" "node_test_count" "node_test_timeout" "node_test_probes" "node_test_threads" "download_test_enabled" "download_test_count" "download_test_url" "download_test_time" "iterate_enabled" "iterate_minutes"
     get_servers_config "ssr_services" "ssr_enabled" "passwall_enabled" "passwall_services" "passwall2_enabled" "passwall2_services" "bypass_enabled" "bypass_services" "vssr_enabled" "vssr_services" "DNS_enabled" "AliDNS_ip_count" "HOST_enabled" "MosDNS_enabled" "MosDNS_ip_count" "openclash_restart" "AstraDNS_enabled" "AstraDNS_config" "AstraDNS_bin"
     # 五个 CM 备选 IP 列表（ip_list 命名段 list1..list5）
     local _n
@@ -251,6 +254,47 @@ function first_result_ip(){
     sed -n '2,$p' "$1" 2>/dev/null | grep -v '^#' | awk -F, 'NF >= 7 && $1 != "" { print $1; exit }'
 }
 
+# ── 复测现有最优 IP（retest 入口）─────────────────────────────
+# 不重新下载在线列表：候选 = 各节点当前 address + 当前 result.csv 中该节点的行。
+# 用于对「已经优选出来的一小撮 IP」做一轮延迟 + 下载实测，快速确认/重排，
+# 不必再拉 1~2 万条 CM 源。每个待测节点的候选写入 RUN_DIR/retest_ips_<node>.txt。
+build_retest_list_one() {
+    # 注意：不能写成 local nodeid="$1" out="...${nodeid}..." —— shell 会先展开整条 local
+    # 命令的所有 RHS 再赋值，${nodeid} 此时还未定义（set -u 下直接报 unbound variable）。
+    local nodeid="$1" maxn="$2"
+    local out="${RUN_DIR}/retest_ips_${nodeid}.txt"
+    local remarks addr tmp="${out}.tmp"
+    remarks=$(uci -q get "passwall.${nodeid}.remarks" 2>/dev/null)
+    remarks="${remarks//,/ }"
+    addr=$(uci -q get "passwall.${nodeid}.address" 2>/dev/null)
+    : > "$tmp" 2>/dev/null || return 1
+    # 当前已应用的地址通常就是上次的最优选，放在最前面一起复测；非 IP（域名等）跳过
+    case "$addr" in
+        ''|*[!0-9a-fA-F:.]*) ;;
+        *) echo "$addr" >> "$tmp" ;;
+    esac
+    if [ -f "$IP_FILE" ] && [ -n "$remarks" ]; then
+        sed -n '2,$p' "$IP_FILE" 2>/dev/null | grep -av '^#' | \
+            awk -F, -v n="$remarks" 'NF>=8 && $1!="" && $8==n {print $1}' >> "$tmp"
+    fi
+    awk '!seen[$0]++' "$tmp" | head -n "$maxn" > "$out"
+    rm -f "$tmp"
+    [ -s "$out" ]
+}
+
+# 为所有可能的待测节点建复测候选文件。返回 0 = 至少一个节点有候选。
+# 节点来源：node_ip 段的 worker + 旧 passwall_services + 单节点回退 node_test_node。
+build_retest_ip_lists() {
+    local maxn="$1" _w _seen="" _any=0
+    for _w in ${NODE_IP_WORKERS:-} ${passwall_services:-} ${node_test_node:-}; do
+        [ -n "$_w" ] || continue
+        case " $_seen " in *" $_w "*) continue ;; esac
+        _seen="$_seen $_w"
+        build_retest_list_one "$_w" "$maxn" && _any=1
+    done
+    [ "$_any" = "1" ]
+}
+
 # 持久历史：把每次合并的「各节点最优」追加到 /etc/passwall-speedtest/history.csv。
 # /tmp 下的 result.csv.* 是内存盘（重启即清）且仅 10 份，图表的长期历史依赖此文件。
 # 格式与 result.csv 兼容：每块以 "# Speed test time: ..." 开头，其后为该次各节点最优行
@@ -275,9 +319,10 @@ function append_persistent_history(){
     fi
 }
 
-# 按延迟升序排序结果数据行，表头保留在首行。
-# 兼容测速被中断、二进制未完成最终排序的情况，保证最快 IP 位于首行。
-# 第二参数 mode=latency 时（走节点测速模式，下载列恒 0.00）仅按延迟升序排。
+# 排序结果数据行，表头保留在首行。
+# 默认排序：下载速度（第 6 列）降序，速度相同或都为 0（未做下载实测）时按延迟升序 ——
+#   有真实下载速度时“最快=吞吐最高”，没有时自然退化为“最快=延迟最低”。
+# 第二参数 mode=latency 时仅按延迟升序排：用于下载实测之前挑出延迟最优的 N 个候选。
 # 用 awk 自实现排序，不依赖 sort 的 -k/-n 浮点修饰符（某些 busybox sort 会忽略 -k 键
 # 退化为整行字典序，导致选错最优 IP）。
 function sort_result(){
@@ -434,7 +479,12 @@ function speed_test(){
     # 拉本地 SOCKS，curl -I 取 time_pretransfer 测延迟，多 worker 并行、多 probe fail-fast。
     # 结果写回各 passwall worker 节点。
     local _rc=0
-    if [ "${iterate_enabled:-0}" = "1" ]; then
+    if [ "${RETEST_FROM_RESULT:-0}" = "1" ]; then
+        # 复测现有最优 IP：固定一轮延迟 + 下载实测，不受 iterate_enabled 影响
+        echolog "════ 复测现有最优 IP（一轮延迟 + 下载实测，不重新下载在线列表）════"
+        node_speed_test
+        _rc=$?
+    elif [ "${iterate_enabled:-0}" = "1" ]; then
         case "${iterate_minutes:-}" in ''|*[!0-9]*) echolog "迭代测速时长无效，中止"; return 1 ;; esac
         [ "${iterate_minutes}" -ge 1 ] 2>/dev/null || { echolog "迭代测速时长须 ≥1 分钟，中止"; return 1; }
         iterate_speed_test
@@ -621,16 +671,50 @@ nt_lock_acquire() {
     local _i=0
     while ! mkdir "${NT_LOCKDIR}" 2>/dev/null; do
         _i=$((_i + 1))
-        if [ "$_i" -ge 300 ]; then
+        if [ "$_i" -ge 30 ]; then
             echolog "警告：uci 串行锁等待超 30s，强制接管（疑有 worker 僵死）"
             rm -rf "${NT_LOCKDIR}" 2>/dev/null
             mkdir "${NT_LOCKDIR}" 2>/dev/null
             return 0
         fi
-        sleep 0.1
+        # 用整数秒：部分 busybox 未启用浮点 sleep（LEDE 24.10 实测 `sleep 0.1` 直接报错
+        # 且不睡眠），会让锁超时瞬间触发。30 次 × 1s = 30s，与提示一致。
+        sleep 1
     done
 }
 nt_lock_release() { rmdir "${NT_LOCKDIR}" 2>/dev/null; }
+
+# 下载实测串行锁：同一时刻只允许一个 IP 处于下载测试中，否则多个 worker 并发下载会
+# 互抢路由器 WAN 带宽，每个 IP 测出的“速度”都只是被瓜分后的一部分，无法横向比较。
+# token 用每个下载唯一的 flag（worker+序号），释放时只删自己的锁，避免超时接管后
+# 旧持有者醒来误删新持有者的锁。等待超过 120s 视为持有者僵死（单次下载上限 60s +
+# SOCKS 启动），强制接管——正常情况下 worker 不会持锁这么久。
+nt_dl_lock_acquire() {
+    local _token="$1" _i=0
+    [ -n "${DL_LOCK_DIR:-}" ] || return 0
+    while ! mkdir "$DL_LOCK_DIR" 2>/dev/null; do
+        # 等锁期间收到停止信号（用户停止/别的 worker 先完成）→ 不再排队下载
+        if [ -n "${RUN_DIR:-}" ] && \
+           { [ -f "${RUN_DIR}/.nt_stop" ] || [ -f "${RUN_DIR}/.iter_stop" ]; }; then
+            return 1
+        fi
+        _i=$((_i + 1))
+        if [ "$_i" -ge 120 ]; then
+            echolog "下载测速串行锁等待超过 120s，强制接管（疑有 worker 僵死）"
+            rm -rf "$DL_LOCK_DIR" 2>/dev/null
+            continue
+        fi
+        # 同上：整数秒以兼容不支持浮点 sleep 的 busybox；120 次 × 1s = 120s
+        sleep 1
+    done
+    echo "$_token" > "$DL_LOCK_DIR/token" 2>/dev/null
+    return 0
+}
+nt_dl_lock_release() {
+    [ -n "${DL_LOCK_DIR:-}" ] || return 0
+    [ "$(cat "$DL_LOCK_DIR/token" 2>/dev/null)" = "$1" ] && rm -rf "$DL_LOCK_DIR" 2>/dev/null
+    return 0
+}
 
 # 测速前把 passwall 全局主节点切到稳定节点；还原由 node_test_cleanup 兜底。
 # 节点变更需 /etc/init.d/passwall restart 才能实时生效；切换在拉起 worker 之前、
@@ -702,7 +786,8 @@ nt_probe_one_ip() {
     uci set passwall.${_W}.address="${_ip}"
     uci commit passwall
     nt_lock_release
-    # 拉本地 SOCKS
+    # 拉本地 SOCKS（passwall 重启/异常时可能清掉该目录，缺目录会导致 run_socks 写配置失败）
+    mkdir -p /tmp/etc/passwall 2>/dev/null
     NO_REC_PROCESS=1 /usr/share/passwall/app.sh run_socks \
         flag="${_flag}" node=${_W} \
         bind=127.0.0.1 socks_port=${_port} \
@@ -718,7 +803,7 @@ nt_probe_one_ip() {
         if [ $_rc -eq 7 ]; then
             _notready=$((_notready + 1))
             [ $_notready -ge 10 ] && break
-            sleep 0.3
+            sleep 1
             continue
         fi
         _notready=0
@@ -769,6 +854,166 @@ nt_probe_one_ip() {
     echo "${_keep} ${_sent} ${_recv} ${_loss} ${_avg}"
 }
 
+# ── 下载实测（第二阶段）────────────────────────────────────
+# 延迟初筛之后，对延迟最优的 N 个 IP 实测真实下载吞吐：与延迟探测走同一条链路——
+# 把候选 IP 写进节点 address → run_socks 拉起本地 SOCKS → curl 下载固定大小文件 →
+# 取 speed_download（字节/秒）换算 MB/s → 清理 SOCKS。
+# 分两阶段的原因：延迟探测便宜，可以覆盖全部候选；真实下载贵，只值得测最有希望的 N 个。
+# 结果经全局变量 NT_DL_SPEED 返回（两位小数 MB/s，失败为 0），不用 stdout：
+# 本函数内部会 echolog（stdout 也有一份），若用 $(...) 取返回值会把日志混进速度值。
+# 参数: $1=node $2=ip $3=download_url $4=max_time $5=socks_port $6=flag
+NT_DL_SPEED=0
+nt_download_one_ip() {
+    local _W=$1 _ip=$2 _durl=$3 _tmo=$4 _port=$5 _flag=$6
+    NT_DL_SPEED=0
+    nt_lock_acquire
+    uci set passwall.${_W}.address="${_ip}"
+    uci commit passwall
+    nt_lock_release
+    mkdir -p /tmp/etc/passwall 2>/dev/null
+    # 先删掉同 flag 的旧配置：保证下面校验用的一定是本次 run_socks 刚生成的文件，
+    # 而不是历史残留（flag 含 PID+IP 序号，正常情况下不会重名，这里再兜一层）
+    rm -f "/tmp/etc/passwall/${_flag}.json" "/tmp/etc/passwall/${_flag}.json_test.log" 2>/dev/null
+    NO_REC_PROCESS=1 /usr/share/passwall/app.sh run_socks \
+        flag="${_flag}" node=${_W} \
+        bind=127.0.0.1 socks_port=${_port} \
+        config_file=${_flag}.json >>$LOG_FILE 2>&1
+    # ── 链路校验：证明下载确实经过候选 IP ──
+    # passwall app.sh run_socks 会把本次生成的客户端配置写到
+    # /tmp/etc/passwall/<config_file>（即 /tmp/etc/passwall/<flag>.json）。这份配置就是
+    # 本地 SOCKS 进程实际使用的出站配置，其中出站服务器地址必须是我们刚写入节点 address
+    # 的候选 IP。文件缺失（run_socks 写配置失败）或不含该 IP（复用了旧配置）时，测出的
+    # 速度与候选 IP 无关，直接判本次失败，绝不把脏速度写进结果。
+    local _cfg="/tmp/etc/passwall/${_flag}.json" _verify=1
+    if [ ! -s "$_cfg" ]; then
+        _verify=0
+        echolog "下载测速校验失败：SOCKS 配置 ${_cfg} 不存在（run_socks 未生成配置），跳过该 IP"
+    elif ! grep -qF -- "$_ip" "$_cfg" 2>/dev/null; then
+        _verify=0
+        echolog "下载测速校验失败：SOCKS 配置未指向候选 IP ${_ip}，跳过该 IP"
+    fi
+    # 就绪轮询（curl rc 7 = SOCKS 尚未就绪）+ 一次下载测速。--max-time 截断时 curl 返回 28，
+    # 但已下载字节数与平均速度仍然有效，故 0 / 28 都接受（前提是 HTTP 2xx 且确实收到数据）。
+    local _try=0 _res='' _rc=0 _code='' _bytes=0 _bps=0 _pf
+    while [ "$_verify" = "1" ] && [ $_try -lt 10 ]; do
+        _res=$(curl -x socks5h://127.0.0.1:${_port} -sL -o /dev/null \
+            --connect-timeout 3 --max-time ${_tmo} \
+            -w "%{http_code} %{size_download} %{speed_download}" "${_durl}" 2>/dev/null)
+        _rc=$?
+        if [ $_rc -eq 7 ]; then
+            _try=$((_try + 1))
+            sleep 1
+            continue
+        fi
+        break
+    done
+    # 清理本次 SOCKS（与延迟探测一致，按 flag 前缀精确通配）
+    for _pf in /tmp/etc/passwall/*"${_flag}"*_plugin.pid; do
+        [ -s "$_pf" ] && kill -9 "$(head -n1 "$_pf")" >/dev/null 2>&1
+    done
+    busybox pgrep -af "${_flag}" 2>/dev/null | awk '! /passwall-speedtest\.sh/{print $1}' | xargs kill -9 >/dev/null 2>&1
+    rm -rf /tmp/etc/passwall/*"${_flag}"* 2>/dev/null
+    [ "$_verify" = "1" ] || { NT_DL_SPEED=0; return 0; }
+    _code="${_res%% *}"; _res="${_res#* }"
+    _bytes="${_res%% *}"; _bps="${_res##* }"
+    case "$_code" in 2[0-9][0-9]) ;; *) NT_DL_SPEED=0; return 0 ;; esac
+    case "$_rc" in 0|28) ;; *) NT_DL_SPEED=0; return 0 ;; esac
+    # 16KB 下限：避免把 0 字节/极小的错误响应算成虚高速度
+    NT_DL_SPEED=$(awk -v b="${_bytes:-0}" -v s="${_bps:-0}" 'BEGIN{
+        if ((b+0) < 16384 || (s+0) <= 0) print "0"
+        else printf "%.2f\n", (s+0)/1048576
+    }')
+    return 0
+}
+
+# 下载实测阶段：把 worker 结果文件里延迟最优的前 N 行逐 IP 实测下载速度，写入第 6 列
+# （下载速度 MB/s）；成功测速时按速度降序重排（速度相同再按延迟升序），下载失败的行剔除。
+# 若一个都没测成功（如测试 URL 经该节点不可达），保留原延迟排序结果，不丢延迟阶段的成果。
+# 参数: $1=node $2=result_file $3=node_name $4=count $5=url $6=timeout $7=socks_port $8=flag
+nt_download_phase() {
+    local _W=$1 _rfile=$2 _Wn=$3 _cnt=$4 _durl=$5 _tmo=$6 _port=$7 _flag=$8
+    local _rows="${_rfile}.rows" _out="${_rfile}.dl" _line _ip _spd _hdr
+    local _i=0 _n _tested=0 _failed=0 _best_ip='' _best_spd=0 _stopped=0
+    [ -f "$_rfile" ] || return 0
+    _n=$(awk 'END{print NR+0}' "$_rfile" 2>/dev/null)
+    [ "$_n" -gt 1 ] || return 0
+    # 先按延迟升序排：保证“前 N 个”就是延迟最优的 N 个。上一会话沿用（.prev）或旧
+    # result.csv 的行可能是按下载速度排的，不能直接拿来取前 N。
+    sort_result "$_rfile" latency
+    # 取数据行：跳过表头/注释/空行。不假设表头一定在第 1 行（.prev 恢复等路径可能没有
+    # 表头），否则会把第一条数据行当表头丢掉，该节点最优 IP 恰好就在首行。
+    # 同时把第 6 列清零：旧会话/上轮沿用的速度不能参与本次排序（只信本次实测值）
+    awk -F, -v OFS=, 'NF>=7 && $1!="" && $1 !~ /^#/ && $1 != "IP 地址" {$6="0.00"; print}' \
+        "$_rfile" > "$_rows" 2>/dev/null
+    _n=$(awk 'END{print NR+0}' "$_rows" 2>/dev/null)
+    if [ "$_n" -eq 0 ]; then rm -f "$_rows"; return 0; fi
+    [ "$_cnt" -ge 1 ] 2>/dev/null || _cnt=5
+    [ "$_cnt" -gt "$_n" ] && _cnt=$_n
+
+    _hdr=$(sed -n '1p' "$_rfile" 2>/dev/null)
+    case "$_hdr" in
+        'IP 地址'*) ;;
+        *) _hdr='IP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码' ;;
+    esac
+    echo "$_hdr" > "$_out"
+
+    echolog "下载测速 [${_Wn}] 开始：对延迟最优的 ${_cnt} 个 IP 实测下载（${_durl}，单 IP 上限 ${_tmo}s）"
+    while IFS= read -r _line; do
+        [ -n "$_line" ] || continue
+        _i=$((_i + 1))
+        if [ "$_i" -le "$_cnt" ] && [ "$_stopped" = "0" ]; then
+            # 用户停止/别的 worker 先完成时不再开启新的下载；已测到的速度仍然保留
+            if [ -f "${RUN_DIR}/.nt_stop" ] || [ -f "${RUN_DIR}/.iter_stop" ]; then
+                _stopped=1
+                echolog "下载测速 [${_Wn}] 收到停止信号，余下 IP 不再下载测速"
+            fi
+        fi
+        if [ "$_i" -le "$_cnt" ] && [ "$_stopped" = "0" ]; then
+            _ip="${_line%%,*}"
+            # 每个 IP 一个独立 flag/config 文件，杜绝复用上一个 IP 的 SOCKS 配置。
+            # 全局串行锁保证同一时刻只有一个 worker 在下载，否则 WAN 带宽被瓜分，
+            # 各 IP 的速度没有可比性。结果走全局 NT_DL_SPEED（函数内部会 echolog，
+            # 不能用 $(...) 抓 stdout）。
+            if nt_dl_lock_acquire "${_flag}_${_i}"; then
+                nt_download_one_ip "$_W" "$_ip" "$_durl" "$_tmo" "$_port" "${_flag}_${_i}"
+                _spd="$NT_DL_SPEED"
+                nt_dl_lock_release "${_flag}_${_i}"
+                log_size_guard
+                if [ "$(awk -v s="$_spd" 'BEGIN{print ((s+0)>0)?1:0}')" = "1" ]; then
+                    _tested=$((_tested + 1))
+                    if [ "$(awk -v a="$_spd" -v b="$_best_spd" 'BEGIN{print ((a+0)>(b+0))?1:0}')" = "1" ]; then
+                        _best_spd="$_spd"; _best_ip="$_ip"
+                    fi
+                    echo "$_line" | awk -F, -v OFS=, -v s="$_spd" '{$6=s; print}' >> "$_out"
+                    echolog "下载测速 [${_Wn}] ${_i}/${_cnt} - ${_ip} 速度 ${_spd} MB/s [保留]"
+                else
+                    _failed=$((_failed + 1))
+                    echolog "下载测速 [${_Wn}] ${_i}/${_cnt} - ${_ip} 下载失败 [丢弃]"
+                fi
+            else
+                # 等锁时收到停止信号：余下 IP 保留延迟结果，不再下载
+                _stopped=1
+                echolog "下载测速 [${_Wn}] 收到停止信号，余下 IP 不再下载测速"
+                echo "$_line" >> "$_out"
+            fi
+        else
+            echo "$_line" >> "$_out"
+        fi
+    done < "$_rows"
+    rm -f "$_rows"
+
+    if [ "$_tested" -gt 0 ]; then
+        # 按下载速度降序（未测到的行速度 0 排在后面，同速度按延迟升序）
+        sort_result "$_out"
+        mv -f "$_out" "$_rfile"
+        echolog "下载测速 [${_Wn}] 完成：成功 ${_tested}/${_cnt}，失败 ${_failed}，最优 ${_best_ip} ${_best_spd} MB/s"
+    else
+        rm -f "$_out"
+        echolog "下载测速 [${_Wn}] 未取得任何有效速度（测试 URL 可能经该节点不可达），保留延迟排序结果"
+    fi
+    return 0
+}
+
 # 普通 worker（非迭代模式）：通过节点 $2 的链路测全部候选 IP（$5），保留行写入结果文件 $4。
 # ash 子 shell 里 local 可用（已验证）。
 # 参数: $1=idx $2=node $3=origaddr $4=result_file $5=ip_list $6=probe_url $7=timeout $8=probes $9=socks_port $10=flag
@@ -799,8 +1044,14 @@ node_test_worker() {
         _st=$([ "$_keep" = "1" ] && echo "保留" || echo "丢弃")
         echolog "进度: 走节点测速 [${_Wn}] ${_idx2}/${_total} ($((_idx2*100/_total))%) - ${_ip} 延迟 ${_avg}ms 丢包 ${_loss} [${_st}]"
     done
-    # 本 worker 结果按延迟升序排（首行即该节点最优）
+    # 本 worker 结果按延迟升序排（首行即延迟初筛的最优），再对前 N 个做真实下载实测；
+    # 下载阶段成功后结果按实测速度重排（首行即该节点下载最快 IP）
     sort_result "$_rfile" latency
+    if [ "${DL_TEST_ENABLED:-1}" = "1" ]; then
+        nt_download_phase "$_W" "$_rfile" "$_Wn" "${DL_TEST_COUNT:-5}" \
+            "${DL_TEST_URL:-https://speed.cloudflare.com/__down?bytes=10000000}" \
+            "${DL_TEST_TIME:-10}" "$_port" "${_flag}_dl"
+    fi
     # 完成标记：有有效结果写 .done（触发首个有效结果即停），否则写 .end（仅释放并发槽）
     if [ -n "$(first_result_ip "$_rfile")" ]; then
         : > "${_rfile}.done"
@@ -823,9 +1074,12 @@ iterate_log_final_summary(){
     [ -n "$_lp" ] || return 1
     _n=$(sed '1d' "$_rf" 2>/dev/null | awk -F, 'NF>=7 && $1!="" {c++} END{print c+0}')
     echolog "迭代 [${_nm}] 最终结果（第 ${_lp} 轮，共 ${_n} 条，完整列表见最佳 IP 表）:"
-    sed '1d' "$_rf" 2>/dev/null | awk -F, 'NF>=7 && $1!="" {print $1, $5, $4}' | head -n 10 | \
-        while read -r _ip _avg _loss; do
-            echolog "  ${_ip} 延迟 ${_avg}ms 丢包 ${_loss}"
+    sed '1d' "$_rf" 2>/dev/null | awk -F, 'NF>=7 && $1!="" {print $1, $5, $4, $6}' | head -n 10 | \
+        while read -r _ip _avg _loss _spd; do
+            case "$_spd" in
+                ''|0|0.0|0.00) echolog "  ${_ip} 延迟 ${_avg}ms 丢包 ${_loss}" ;;
+                *) echolog "  ${_ip} 延迟 ${_avg}ms 丢包 ${_loss} 下载 ${_spd} MB/s" ;;
+            esac
         done
     [ "${_n:-0}" -gt 10 ] && echolog "  ……其余 $((_n - 10)) 条见最佳 IP 表（已按节点写入 result.csv）"
     return 0
@@ -859,9 +1113,16 @@ node_iterate_worker() {
     # 有了这份 .prev，本会话一个 IP 都没通过时（如节点链路故障）能沿用上一次结果
     if [ ! -f "${_rfile}.prev" ] && [ -f "$IP_FILE" ]; then
         local _pname="${_Wn//,/ }"
-        sed -n '2,$p' "$IP_FILE" 2>/dev/null | grep -av '^#' | \
-            awk -F, -v n="$_pname" 'NF>=8 && $1!="" && $8==n' > "${_rfile}.prev"
-        [ -s "${_rfile}.prev" ] || rm -f "${_rfile}.prev"
+        # 从 result.csv 取该节点的旧结果时：① 补上表头（旧实现直接搬数据行，
+        # first_result_ip 会把它当表头跳过，丢掉该节点最优 IP）；② 去掉末列节点名，
+        # 保持 worker 结果文件 7 列格式（合并段会统一次追加节点名）。
+        {
+            echo "IP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码"
+            sed -n '2,$p' "$IP_FILE" 2>/dev/null | grep -av '^#' | \
+                awk -F, -v n="$_pname" 'NF>=8 && $1!="" && $8==n {print $1","$2","$3","$4","$5","$6","$7}'
+        } > "${_rfile}.prev"
+        # 只有表头 = 该节点在 result.csv 里没有旧结果
+        [ "$(awk 'END{print NR+0}' "${_rfile}.prev")" -gt 1 ] || rm -f "${_rfile}.prev"
     fi
     # 本轮结果从空表开始，只有通过集落盘时才覆盖；残留文件不再被当作本轮结果合并
     echo "IP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码" > "$_rfile"
@@ -957,6 +1218,12 @@ node_iterate_worker() {
         mv -f "${_rfile}.prev" "$_rfile"
         echolog "迭代 [${_Wn}] 本会话无通过 IP，沿用上一会话结果"
     fi
+    # 迭代收敛后的下载实测：只测最终通过集中延迟最优的 N 个，按实测吞吐重排（首行即该节点最快 IP）
+    if [ "${DL_TEST_ENABLED:-1}" = "1" ] && [ -n "$(first_result_ip "$_rfile")" ]; then
+        nt_download_phase "$_W" "$_rfile" "$_Wn" "${DL_TEST_COUNT:-5}" \
+            "${DL_TEST_URL:-https://speed.cloudflare.com/__down?bytes=10000000}" \
+            "${DL_TEST_TIME:-10}" "$_port" "${_flag}_dl"
+    fi
     # 结束摘要：轮次号落盘（最终轮完整测速结果由合并段统一打出，保证收尾日志逐节点齐全；
     # 不在 worker 退出点打印——提前收敛的节点其结果会被淹没在收尾段之前的进度行里）
     [ "${_lastpass:-0}" -ge 1 ] && echo "${_lastpass}" > "${_rfile}.meta"
@@ -998,6 +1265,27 @@ node_speed_test() {
     case "$threads" in ''|*[!0-9]*) threads=5 ;; esac
     [ "$threads" -ge 0 ] 2>/dev/null || threads=5
 
+    # ── 下载实测（第二阶段）：延迟初筛后，对每个 worker 延迟最优的 N 个 IP 走同一节点
+    # 链路真实下载固定大小文件，按实测吞吐（MB/s）重排并选最优。开关缺省为开（老配置
+    # 未写入该项时也启用），显式写 0/off 才关闭。
+    DL_TEST_ENABLED=1
+    case "${download_test_enabled:-1}" in
+        0|no|false|off|OFF|False|No) DL_TEST_ENABLED=0 ;;
+    esac
+    DL_TEST_COUNT="${download_test_count:-5}"
+    case "$DL_TEST_COUNT" in ''|*[!0-9]*) DL_TEST_COUNT=5 ;; esac
+    [ "$DL_TEST_COUNT" -ge 1 ] 2>/dev/null || DL_TEST_COUNT=5
+    # 每个候选要真实下载一个 10MB 文件，候选越多越费流量/时间；硬上限 5 个
+    [ "$DL_TEST_COUNT" -le 5 ] 2>/dev/null || DL_TEST_COUNT=5
+    DL_TEST_URL="${download_test_url:-https://speed.cloudflare.com/__down?bytes=10000000}"
+    [ -n "$DL_TEST_URL" ] || DL_TEST_URL='https://speed.cloudflare.com/__down?bytes=10000000'
+    DL_TEST_TIME="${download_test_time:-10}"
+    case "$DL_TEST_TIME" in ''|*[!0-9]*) DL_TEST_TIME=10 ;; esac
+    [ "$DL_TEST_TIME" -ge 1 ] 2>/dev/null || DL_TEST_TIME=10
+    [ "$DL_TEST_TIME" -le 60 ] 2>/dev/null || DL_TEST_TIME=60
+    # 下载实测串行锁目录：多个 worker 同时下载会互抢 WAN 带宽，速度数字不可信
+    DL_LOCK_DIR="${RUN_DIR}/.download_test_lock"
+
     # ── 候选 IP 来源 ──
     local count="${node_test_count:-30}"
     case "$count" in ''|*[!0-9]*) count=30 ;; esac
@@ -1005,7 +1293,13 @@ node_speed_test() {
 
     local ip_source_mode="file"
     local selected_ip_file=""
-    if [ "${ip_source:-}" = "online" ]; then
+    if [ "${RETEST_FROM_RESULT:-0}" = "1" ]; then
+        # 复测模式：候选来自当前 result.csv + 各节点当前 address，绝不重新拉在线列表。
+        read_node_ip_map
+        build_retest_ip_lists "$count" || { echolog "复测模式：没有可复测的候选 IP（result.csv 为空且节点 address 不是 IP），中止"; return 1; }
+        echolog "复测模式：候选来自现有 result.csv / 各节点当前 address（不重新下载在线列表），每节点最多 ${count} 个"
+        ip_source_mode="retest"
+    elif [ "${ip_source:-}" = "online" ]; then
         # online CM 源：一次下载原始列表，按各 ip_list 的 regions 分别过滤成 ip_list_<N>.txt
         migrate_ip_online_regions
         fetch_online_raw || return 1
@@ -1030,7 +1324,9 @@ node_speed_test() {
     # 迭代模式下这只是该 worker 的「初始候选」——worker 内部的收敛循环自己维护缩小后的列表。
     get_worker_ips(){
         local nodeid="$1" src_file=""
-        if [ "$ip_source_mode" = "online" ]; then
+        if [ "$ip_source_mode" = "retest" ]; then
+            src_file="${RUN_DIR}/retest_ips_${nodeid}.txt"
+        elif [ "$ip_source_mode" = "online" ]; then
             local N
             N=$(resolve_node_list "$nodeid")
             if [ -n "$N" ]; then
@@ -1087,6 +1383,9 @@ node_speed_test() {
             rm -f "$NT_ORIG_FILE"; NT_ORIG_FILE=""
         else
             echolog "开始走节点测速（多节点并行: ${widx} 个 worker, 每IP探测 ${probes} 次, 超时 ${timeout}s, 并发上限 ${threads}）"
+            if [ "$DL_TEST_ENABLED" = "1" ]; then
+                echolog "下载实测已启用：每个 worker 延迟最优的 ${DL_TEST_COUNT} 个 IP 逐 IP 实测下载（${DL_TEST_URL}，单 IP 上限 ${DL_TEST_TIME}s），按实测吞吐选最优"
+            fi
             echolog "提示：测速期间所有 worker 节点的 address 会被反复改写，这些节点会短暂抖动，测完各写各的最优 IP"
             # 记录实测过的 worker 集合，供 ip_replace/passwall_best_ip 跳过（保留各节点自己的最优 IP）
             NODE_TESTED_WORKERS="$valid_workers"
@@ -1131,7 +1430,7 @@ node_speed_test() {
                     # 达到并发上限：轮询回收已完成 worker 释放空位，或首个有效结果触发停止
                     while [ "$(echo $NT_RUNNING | wc -w)" -ge "$threads" ] && [ "$_stop" != "1" ]; do
                         if nt_scan_running; then _stop=1; break; fi
-                        [ "$(echo $NT_RUNNING | wc -w)" -ge "$threads" ] && sleep 0.5
+                        [ "$(echo $NT_RUNNING | wc -w)" -ge "$threads" ] && sleep 1
                     done
                     [ "$_stop" = "1" ] && break
                     launched=$((launched + 1))
@@ -1150,7 +1449,7 @@ node_speed_test() {
                 # 排空仍运行的 worker（无提前停止时正常完成路径）
                 while [ -n "$NT_RUNNING" ] && [ "$_stop" != "1" ]; do
                     if nt_scan_running; then _stop=1; break; fi
-                    [ -n "$NT_RUNNING" ] && [ "$_stop" != "1" ] && sleep 0.5
+                    [ -n "$NT_RUNNING" ] && [ "$_stop" != "1" ] && sleep 1
                 done
                 # 提前停止：写停止标志，其余 worker 跑完当前 IP 自行 break 退出，wait 收尸（不 kill）
                 if [ "$_stop" = "1" ]; then
@@ -1181,8 +1480,9 @@ node_speed_test() {
                 [ -n "$mw" ] || continue
                 mwfile="${RUN_DIR}/result.csv.tmp.$mw"
                 # 被杀 worker 的部分结果文件未经其自身排序；这里补排，使 first_result_ip
-                # 取到该 worker 最低延迟 IP 写回 passwall address。对已完成 worker 幂等。
-                sort_result "$mwfile" latency
+                # 取到该 worker 的最优 IP 写回 passwall address。排序键与 worker 内一致：
+                # 有下载实测速度时按速度降序，否则（全 0/未测）按延迟升序。对已完成 worker 幂等。
+                sort_result "$mwfile"
                 mwbest=$(first_result_ip "$mwfile")
                 local mwname
                 mwname="$(uci -q get "passwall.${mw}.remarks" 2>/dev/null)"; mwname="${mwname:-$mw}"
@@ -1202,8 +1502,9 @@ node_speed_test() {
                 rm -f "$mwfile" "${mwfile}.meta" "${mwfile}.prev" 2>/dev/null
             done < "$NT_ORIG_FILE"
             rm -f "${NT_ORIG_FILE}"; NT_ORIG_FILE=""
-            # 合并结果按延迟升序排，供 UI/图表展示（首行=全局最低延迟，供 DNS/host 用）
-            sort_result "$merged" latency
+            # 合并结果排序供 UI/图表展示（首行供 DNS/host 用）：有下载实测速度时按实测吞吐
+            # 降序（下载最快的节点排前面），未测/速度 0 的行按延迟升序排在后面
+            sort_result "$merged"
             if [ -z "$(first_result_ip "$merged")" ]; then
                 echolog "走节点测速所有 worker 结果均为空，保留上一次结果"
                 rm -f "$merged" "$reapply"
@@ -1229,7 +1530,13 @@ node_speed_test() {
             bestip=$(first_result_ip "$IP_FILE")
             rm -f "$reapply" "${RUN_DIR}/.nt_committing" 2>/dev/null
             trap node_test_cleanup EXIT INT TERM
-            [ -n "$bestip" ] && echolog "走节点测速全部完成，全局最低延迟 IP ${bestip}（已写回各 worker 节点；已清理测速期间 passwall 新增的异常节点）"
+            if [ -n "$bestip" ]; then
+                if [ "${DL_TEST_ENABLED:-1}" = "1" ]; then
+                    echolog "走节点测速全部完成，全局最优 IP ${bestip}（有下载实测时按实测吞吐排序；已写回各 worker 节点；已清理测速期间 passwall 新增的异常节点）"
+                else
+                    echolog "走节点测速全部完成，全局最低延迟 IP ${bestip}（已写回各 worker 节点；已清理测速期间 passwall 新增的异常节点）"
+                fi
+            fi
             NODE_TEST_DONE=1; node_test_cleanup; trap - EXIT INT TERM
             return 0
         fi
@@ -1252,6 +1559,10 @@ node_speed_test() {
 
     # 测前快照 /etc/config/passwall：测后还原以抹掉 passwall 测速中途新增的异常节点段
     nt_snapshot || { echolog "passwall 快照失败，中止"; return 1; }
+
+    # uci 串行锁目录：多 worker 路径已在分支内设置；单节点路径此前遗漏，导致
+    # nt_lock_acquire 对着空路径 mkdir 失败、每次都空等 30s 才强制接管（每 IP 多 30s）。
+    NT_LOCKDIR="${RUN_DIR}/.node_test_lock"
 
     # 单节点候选 IP（按其 node_ip 指派或默认列表；非在线模式共享 selected_ip_file）
     local ip_list total
@@ -1524,12 +1835,13 @@ if [ "$1" ] ;then
     # （定时任务重叠、UI 连点、SSH 手敲），直接退出——两套 worker 会抢同一批 passwall 节点
     # 并互删中间状态，跑出来的结果是脏的。
     case "$1" in
-        start|test|replace)
+        start|test|replace|retest)
             run_lock_acquire || { echolog "已有测速在运行（PID $(cat "$RUN_LOCK_DIR/pid" 2>/dev/null)），本次 $1 跳过"; exit 1; }
             ;;
     esac
     [ $1 == "start" ] && speed_test && ip_replace
     [ $1 == "test" ] && speed_test
+    [ $1 == "retest" ] && { RETEST_FROM_RESULT=1; speed_test && ip_replace; }
     [ $1 == "replace" ] && ip_replace
     run_lock_release
     exit

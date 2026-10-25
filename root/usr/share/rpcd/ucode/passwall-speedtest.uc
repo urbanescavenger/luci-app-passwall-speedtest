@@ -139,6 +139,15 @@ function start() {
 	return {};
 }
 
+// 复测现有最优 IP：只对当前 result.csv + 各节点现有 address 做一轮延迟 + 下载实测，
+// 不重新下载在线列表。不 kill 现有运行——脚本入口的单实例锁会跳过并记一行日志，
+// 避免用户误点把正在跑的整轮测速杀掉。
+function start_retest() {
+	command(shquote(RUN_SCRIPT) + ' retest >/dev/null 2>&1 &');
+
+	return {};
+}
+
 // 记录的主进程 PID 是否还活着、且确实是本脚本。只看 /proc/<pid> 存在会被「PID 被无关进程
 // 复用」骗过（同脚本 run_lock_acquire 的判据），故再匹配一次 cmdline。
 function run_pid_alive(pid) {
@@ -301,6 +310,7 @@ function parse_run_file(path, idx_of_remarks) {
 				idx: (idx_of_remarks[node] != null) ? idx_of_remarks[node] : null,
 				ip: parts[0],
 				latency: +parts[4] || 0,
+				speed: +parts[5] || 0,
 				region: parts[6] || ''
 			});
 		}
@@ -364,6 +374,7 @@ function parse_history_file(path, idx_of_remarks) {
 				idx: (idx_of_remarks[node] != null) ? idx_of_remarks[node] : null,
 				ip: parts[0],
 				latency: +parts[4] || 0,
+				speed: +parts[5] || 0,
 				region: parts[6] || ''
 			});
 		}
@@ -427,9 +438,10 @@ function get_history() {
 
 function get_best_result() {
 	let lines = read_lines(RESULT_FILE);
-	// 按节点独立排序展示：result.csv 本身保持全局延迟升序（DNS 取全局最优/前 N 依赖首行序），
-	// 此处在展示层按末列节点分组——全局升序里各节点行天然组内延迟升序，每组首行即该节点
-	// 自己的最优 IP。节点顺序 = 其最优 IP 在全局排序中首次出现的顺序（即按各节点最优延迟升序）。
+	// 按节点独立排序展示：result.csv 本身保持全局排序（有下载实测速度时按吞吐降序，
+	// 否则按延迟升序；DNS 取全局最优/前 N 依赖首行序），此处在展示层按末列节点分组——
+	// 全局序里同一节点的行仍保序，每组首行即该节点自己的最优 IP。节点顺序 = 其最优 IP
+	// 在全局排序中首次出现的顺序。
 	// 全量展示（日志的「其余 N 条见最佳 IP 表」指向这里），不再截尾 500 行。
 	let header = '';
 	let time_line = '';
@@ -474,9 +486,12 @@ function get_best_result() {
 		let node_rows = rows[order[i]];
 		let best = (length(node_rows) > 0) ? split(node_rows[0], ',') : [];
 
+		let best_speed = +best[5] || 0;
+
 		push(out, '# ── ' + (order[i] != '' ? order[i] : '(无节点)') +
-			'：最优 ' + (best[0] || '-') + ' / ' + (best[4] || '-') + 'ms，共 ' +
-			length(node_rows) + ' 条 ──');
+			'：最优 ' + (best[0] || '-') + ' / ' + (best[4] || '-') + 'ms' +
+			(best_speed > 0 ? (' / ' + best[5] + ' MB/s') : '') +
+			'，共 ' + length(node_rows) + ' 条 ──');
 
 		for (let j = 0; j < length(node_rows); j++)
 			push(out, node_rows[j]);
@@ -591,6 +606,12 @@ return {
 		start: {
 			call: function() {
 				return start();
+			}
+		},
+
+		start_retest: {
+			call: function() {
+				return start_retest();
 			}
 		},
 

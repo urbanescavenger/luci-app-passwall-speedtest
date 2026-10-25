@@ -18,6 +18,12 @@ const callStart = rpc.declare({
 	expect: {}
 });
 
+const callRetest = rpc.declare({
+	object: 'passwall-speedtest',
+	method: 'start_retest',
+	expect: {}
+});
+
 const callStop = rpc.declare({
 	object: 'passwall-speedtest',
 	method: 'stop',
@@ -221,7 +227,7 @@ return view.extend({
 			const run = runs[i];
 			const pts = (run.nodes && run.nodes.length)
 				? run.nodes
-				: [{ node: '', idx: null, ip: run.ip, latency: run.latency, region: run.region }];
+				: [{ node: '', idx: null, ip: run.ip, latency: run.latency, speed: run.speed, region: run.region }];
 
 			for (let j = 0; j < pts.length; j++) {
 				const n = pts[j];
@@ -232,7 +238,7 @@ return view.extend({
 					seriesOrder.push(key);
 				}
 
-				series[key].push({ x: run.time, y: n.latency, node: n.node, ip: n.ip, region: n.region });
+				series[key].push({ x: run.time, y: n.latency, node: n.node, ip: n.ip, speed: n.speed, region: n.region });
 			}
 		}
 
@@ -332,13 +338,15 @@ return view.extend({
 		});
 
 		function pointLabel(p) {
-			return '%s：最优 %s / %sms'.format(p.node || '-', p.ip, p.y);
+			return '%s：最优 %s / %sms'.format(p.node || '-', p.ip, p.y) +
+				(p.speed > 0 ? ' / %s MB/s'.format(p.speed) : '');
 		}
 
 		function pointDetail(p) {
 			return [
 				E('p', {}, pointLabel(p)),
 				E('p', {}, _('Time') + ': ' + (p.x || '')),
+				(p.speed > 0 ? E('p', {}, _('Download speed') + ': ' + p.speed + ' MB/s') : E([])),
 				(p.region ? E('p', {}, _('Region') + ': ' + p.region) : E([]))
 			];
 		}
@@ -355,7 +363,7 @@ return view.extend({
 		const passwallNodes = (nodes.passwall && nodes.passwall.nodes) || [];
 
 		m = new form.Map('passwall-speedtest', _('PassWall Speed Test'),
-			_('Schedules and runs a PassWall node-based Cloudflare IP latency test, writing the fastest IP back to the selected passwall nodes and other integrations') +
+			_('Schedules and runs a PassWall node-based Cloudflare IP test: latency screening first, then a real download test on the fastest candidates; the best IP is written back to the selected passwall nodes and other integrations') +
 			'<br><a href="https://github.com/urbanescavenger/luci-app-passwall-speedtest" target="_blank">⭐ ' + _('Star on GitHub') + '</a>');
 
 		s = m.section(form.NamedSection, 'global', 'global');
@@ -364,7 +372,7 @@ return view.extend({
 		s.tab('basic', _('Basic Settings'));
 
 		o = s.taboption('basic', form.Button, '_speedtest', _('Speed test'),
-			_('Probes candidate Cloudflare IPs through the selected passwall node(s) via a local SOCKS and measures HTTP HEAD latency (<code>time_pretransfer</code>). Only latency is measured (no download bandwidth). The fastest IP is written back to each passwall worker node.'));
+			_('Two-stage test through the selected passwall node(s): first probes every candidate Cloudflare IP via a local SOCKS and measures HTTP HEAD latency (<code>time_pretransfer</code>); then downloads a real file through up to 5 lowest-latency IPs of each worker to measure actual throughput. The best IP by download speed is written back to each passwall worker node (if every download test fails, the latency ranking is kept).'));
 		this.updateButton(o, status.running);
 		actionButton = o;
 		o.onclick = L.bind(function(ev, sectionId) {
@@ -406,6 +414,29 @@ return view.extend({
 				button.disabled = false;
 			});
 		}, this);
+
+		o = s.taboption('basic', form.Button, '_retest', _('Retest current best IPs'),
+			_('Runs ONE latency round + the download test only on the IPs already in the current best list (result.csv) and each node\'s current address. The online IP list is NOT re-downloaded. The best IP is written back as usual.'));
+		o.onclick = function(ev) {
+			const button = ev.currentTarget;
+			button.disabled = true;
+
+			return callStatus().then(function(st) {
+				if (st.running) {
+					ui.addNotification(null, E('p', {}, _('A test is already running')));
+					return;
+				}
+				return callRetest().then(function() {
+					window.setTimeout(function() {
+						window.location = L.url('admin/services/passwall-speedtest/logread');
+					}, 500);
+				});
+			}).catch(function(e) {
+				ui.addNotification(null, E('p', {}, e.message));
+			}).finally(function() {
+				button.disabled = false;
+			});
+		};
 
 		o = s.taboption('basic', form.ListValue, 'ip_source', _('IP list source'),
 			_('Select the built-in Cloudflare IP list, an online CM source, or a custom file used as candidates'));
@@ -507,6 +538,38 @@ return view.extend({
 			_('Cap on concurrently running passwall workers (only relevant when passwall nodes are selected in the Third-Party tab). 0 means run all workers at once. Each worker runs its own SOCKS+curl chain, so high values need more RAM/CPU — keep ≤ node count and mind router limits.'));
 		o.datatype = 'uinteger';
 		o.default = '5';
+		o.rmempty = false;
+
+		o = s.taboption('basic', form.Flag, 'download_test_enabled', _('Real download speed test'),
+			_('After latency screening, download a real file through up to 5 lowest-latency IPs of each worker to measure actual throughput (MB/s). The final best IP is chosen by download speed; IPs whose download test fails are dropped. If every download test fails (e.g. the URL is unreachable through that node), the latency ranking is kept. Each download runs through the node\'s local SOCKS exactly like the latency probe, and the generated SOCKS config is verified to point at the candidate IP before it is accepted.'));
+		o.default = '1';
+		o.rmempty = false;
+
+		o = s.taboption('basic', form.Value, 'download_test_count', _('Download-test candidates per worker'),
+			_('Only the N lowest-latency IPs of each worker are download-tested (default 5, max 5). Each candidate downloads the file below (10 MB by default), so keep it small to limit proxy traffic and runtime.'));
+		o.datatype = 'uinteger';
+		o.default = '5';
+		o.depends('download_test_enabled', '1');
+		o.rmempty = false;
+		o.validate = function(sectionId, value) {
+			if (value && parseInt(value, 10) > 5)
+				return _('At most 5 IPs can be download-tested per worker');
+			return true;
+		};
+
+		o = s.taboption('basic', form.Value, 'download_test_url', _('Download test URL'),
+			_('A fixed-size file downloaded through the node\'s local SOCKS. Cloudflare\'s speed endpoint works best for CF-fronted nodes. The response must be HTTP 2xx with at least 16 KB.'));
+		o.default = 'https://speed.cloudflare.com/__down?bytes=10000000';
+		o.value('https://speed.cloudflare.com/__down?bytes=10000000', _('Cloudflare 10 MB'));
+		o.value('https://speed.cloudflare.com/__down?bytes=20000000', _('Cloudflare 20 MB'));
+		o.depends('download_test_enabled', '1');
+		o.rmempty = false;
+
+		o = s.taboption('basic', form.Value, 'download_test_time', _('Download test time limit (s)'),
+			_('Per-IP curl <code>--max-time</code> for the download test. A partial transfer cut off by this limit still yields a valid average speed.'));
+		o.datatype = 'uinteger';
+		o.default = '10';
+		o.depends('download_test_enabled', '1');
 		o.rmempty = false;
 
 		o = s.taboption('basic', form.Flag, 'iterate_enabled', _('Time-boxed iterative test'),
